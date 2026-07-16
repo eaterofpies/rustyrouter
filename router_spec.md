@@ -42,11 +42,19 @@ When running as PID 1:
    - Mount `/run` (tmpfs) for transient runtime state.
 2. **Signal Handling**:
    - Standard init process signal masking/handling.
+   - Traps system termination and shutdown signals (`SIGINT`, `SIGTERM`, `SIGPWR`).
+   - Upon receiving any of these signals (e.g. from the QEMU ACPI power button or supervisor request), triggers a clean system shutdown: cleans up Netfilter tables, brings network interface links down, and reboots with poweroff mode (`nix::sys::reboot::reboot(RebootMode::RB_POWER_OFF)`).
 3. **Orphan Reaping**:
    - Run a non-blocking or asynchronous reaping loop using `waitpid` to prevent zombie processes.
 4. **Configuration Extraction**:
    - Read and parse `/proc/cmdline` to extract network settings (e.g., `rustyrouter.wan=eth0`, `rustyrouter.lan=eth1`, `rustyrouter.lan_ip=192.168.1.1`).
    - If not provided, automatically detect network interfaces (e.g., sort available interfaces and treat the first as WAN and the second as LAN).
+5. **Panic & Unrecoverable Error Handling**:
+   - Registers a custom panic hook (`std::panic::set_hook`) to intercept Rust panics.
+   - If a panic or unrecoverable error occurs, logs the traceback or error message directly to `stdout`.
+   - Programmatically triggers a system reboot using the `reboot` system call (via `nix::sys::reboot::reboot(RebootMode::RB_AUTOBOOT)`) to reboot the system rather than exiting (which would cause an unclean kernel panic).
+6. **Logging Destination**:
+   - Prints all logs and diagnostics directly to standard output/error (`stdout`/`stderr`). Since the kernel maps the console stream to `/dev/console`, the logs print directly into the host's QEMU monitor/serial console.
 
 ### 2.2 Routing, Address, & NAT Configuration (Kernel-Space)
 
@@ -59,18 +67,22 @@ To allow packets to pass between the interfaces, `rustyrouter` enables IPv4 forw
 #### 2.2.2 Netlink Interface & Route Management (`NETLINK_ROUTE`)
 Using a routing Netlink socket (the standard `rtnetlink` interface), `rustyrouter` performs the following operations asynchronously:
 1. **Loopback Interface (`lo`)**:
-   - Resolves the index of `lo` and sets its link state to `UP` (equivalent to `ip link set lo up`).
+   - Resolves the index of `lo`, sets its link state to `UP` (equivalent to `ip link set lo up`), and assigns the IP address `127.0.0.1/8` to enable internal loopback bindings.
 2. **LAN Interface Link & Address**:
    - Sets the LAN interface link state to `UP`.
    - Clears existing IP addresses on the LAN interface.
    - Assigns the static IP address (e.g., `192.168.1.1/24`) and adds the subnet route to the routing table.
 3. **WAN Interface Link**:
    - Sets the WAN interface link state to `UP`.
-4. **Dynamic WAN Routing (via DHCP)**:
-   - When the WAN DHCP client obtains a lease:
+4. **Dynamic WAN Routing & Lease Expiry (via DHCP)**:
+   - **Lease Obtained**: When the WAN DHCP client obtains a lease:
      - Assigns the leased IP address to the WAN interface (e.g., `10.0.2.15/24`).
+     - **Subnet Collision Avoidance**: Compares the leased WAN IP network with the default LAN subnet configuration. If the WAN IP belongs to the LAN network (default `192.168.1.0/24`), `rustyrouter` reconfigures the LAN interface address to `192.168.0.1/24` (subnet `192.168.0.0/24`). If the WAN IP belongs to `192.168.0.0/24`, the LAN interface address shifts to `192.168.1.1/24`. If there is no conflict, it uses the configured default LAN IP (`192.168.1.1/24` or the value from cmdline).
      - Adds a default gateway route (`0.0.0.0/0` via the DHCP-provided gateway IP) on the WAN interface.
      - Automatically updates or replaces the default gateway route if the WAN lease changes.
+   - **Lease Lost / Expired**: If the WAN DHCP client loses its lease or it expires:
+     - Removes the assigned IP address from the WAN interface.
+     - Deletes the default gateway route associated with that lease to prevent routing blackholes.
 
 #### 2.2.3 Netfilter / nftables NAT Configuration (`NETLINK_NETFILTER`)
 To enable Source NAT (Masquerading), `rustyrouter` communicates directly with the kernel's `nf_tables` subsystem over a netfilter Netlink socket. It constructs and sends standard netlink messages to build the following netfilter objects:
@@ -109,6 +121,7 @@ All services are implemented directly inside the `rustyrouter` binary using asyn
    - By default, forwards client DNS queries to the DNS server IPs dynamically obtained from the WAN interface's DHCP lease.
    - If no DNS servers are provided in the WAN DHCP lease, falls back to the static DNS servers specified on the kernel command line or a compile-time default (e.g., `8.8.8.8`).
    - Maintains a small, in-memory DNS cache.
+   - **UDP Only**: Only UDP DNS proxying is supported. TCP DNS queries (including DNSSEC fallback) are unsupported.
 ---
 
 ## 3. Configuration & Startup Parameters
