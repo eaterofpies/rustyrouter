@@ -12,7 +12,7 @@ This project is an experimental prototype and learning exercise. It has not unde
 ---
 
 ## Key Features
-- **Init Process (PID 1)**: Mounts virtual filesystems (`/proc`, `/sys`, `/dev`, `/run`), reaps orphaned processes, and handles system signals.
+- **Init Process (PID 1)**: Mounts virtual filesystems (`/proc`, `/sys`, `/dev`, `/run`), reaps orphaned processes, handles termination signals, and monitors `/dev/input/event*` via the `evdev` crate to gracefully poweroff the VM on ACPI power button events.
 - **Kernel-Space NAT & Routing**: Interacts directly with the Linux kernel using Netlink sockets (`NETLINK_ROUTE` and `NETLINK_NETFILTER`) to manage interface states, IP assignments, default routes, and Source NAT (Masquerading).
 - **Stateful Firewall**: Implements an `nftables` input filter chain that drops all unsolicited incoming traffic on the WAN interface by default.
 - **Embedded Network Services**:

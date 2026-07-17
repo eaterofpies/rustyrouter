@@ -43,7 +43,7 @@ When running as PID 1:
 2. **Signal Handling**:
    - Standard init process signal masking/handling.
    - Traps system termination and shutdown signals (`SIGINT`, `SIGTERM`, `SIGPWR`).
-   - Upon receiving any of these signals (e.g. from the QEMU ACPI power button or supervisor request), triggers a clean system shutdown: cleans up Netfilter tables, brings network interface links down, and reboots with poweroff mode (`nix::sys::reboot::reboot(RebootMode::RB_POWER_OFF)`).
+   - Upon receiving any of these signals (e.g. from a supervisor request or direct kill), triggers a clean system shutdown: cleans up Netfilter tables, brings network interface links down, and reboots with poweroff mode (`nix::sys::reboot::reboot(RebootMode::RB_POWER_OFF)`).
 3. **Orphan Reaping**:
    - Run a non-blocking or asynchronous reaping loop using `waitpid` to prevent zombie processes.
 4. **Configuration Extraction**:
@@ -55,6 +55,10 @@ When running as PID 1:
    - Programmatically triggers a system reboot using the `reboot` system call (via `nix::sys::reboot::reboot(RebootMode::RB_AUTOBOOT)`) to reboot the system rather than exiting (which would cause an unclean kernel panic).
 6. **Logging Destination**:
    - Prints all logs and diagnostics directly to standard output/error (`stdout`/`stderr`). Since the kernel maps the console stream to `/dev/console`, the logs print directly into the host's QEMU monitor/serial console.
+7. **ACPI Power Button Monitor (evdev)**:
+   - Because a minimal initramfs does not run an ACPI daemon (like `acpid`) or a system manager (like `systemd-logind`), the kernel's ACPI poweroff interrupts are not handled by default.
+   - To catch QEMU ACPI `system_powerdown` events, the init process actively monitors input nodes `/dev/input/event0` to `/dev/input/event4` (populated automatically by the kernel via `devtmpfs`).
+   - It utilizes the portable `evdev` crate's asynchronous event stream API to filter for the standard `KEY_POWER` key-down event, triggering a clean system shutdown and hardware power-off.
 
 ### 2.2 Routing, Address, & NAT Configuration (Kernel-Space)
 

@@ -1,0 +1,18 @@
+[package]
+name = "rustyrouter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.36", features = ["full"] }
+nix = { version = "0.27", features = ["mount", "signal", "process", "reboot"] }
+libc = "0.2"
+futures-util = "0.3"
+evdev = { version = "0.12", features = ["tokio"] }
+
+[profile.release]
+opt-level = "s"      # Optimize for size
+lto = true           # Link-Time Optimization
+codegen-units = 1    # Reduce parallel code generation units to optimize size
+panic = "abort"      # Abort on panic (reduces binary size, though we can still catch/hook panic)
+strip = true         # Strip symbols
