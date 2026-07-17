@@ -4,6 +4,7 @@ mod netfilter;
 mod reaper;
 mod signal;
 mod system;
+mod packet;
 
 use config::RouterConfig;
 use nix::sys::reboot::RebootMode;
