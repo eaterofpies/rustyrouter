@@ -1,4 +1,5 @@
 mod config;
+mod network;
 mod reaper;
 mod signal;
 mod system;
@@ -23,7 +24,7 @@ async fn start_power_button_monitor<S: SystemOps>(sys: Arc<S>, shutdown_flag: Ar
                     use futures_util::StreamExt;
                     while let Some(Ok(event)) = stream.next().await {
                         if event.event_type() == evdev::EventType::KEY
-                            && event.code() == evdev::Key::KEY_POWER.code()
+                            && event.code() == evdev::KeyCode::KEY_POWER.code()
                             && event.value() == 1
                         {
                             println!("\n[acpi] Power button pressed. Triggering system shutdown...");
@@ -69,6 +70,7 @@ async fn main() {
             let _ = sys.reboot(RebootMode::RB_AUTOBOOT);
             return;
         }
+        system::load_required_modules();
     } else {
         println!(
             "[init] Running in standard user environment (PID {}). Skipping VFS mounts.",
@@ -80,7 +82,18 @@ async fn main() {
     let config = RouterConfig::parse(sys.as_ref());
     println!("[init] Configuration loaded: {:?}", config);
 
-    // 4. Lifecycle coordination flag
+    // 4. Configure Network Interfaces (lo, LAN, WAN)
+    if sys.getpid() == Pid::from_raw(1) {
+        if let Err(e) = network::configure_network(
+            &config.wan_interface,
+            &config.lan_interface,
+            &config.lan_ip,
+        ).await {
+            eprintln!("[init] ERROR: Failed to configure network interfaces: {}", e);
+        }
+    }
+
+    // 5. Lifecycle coordination flag
     let shutdown_flag = Arc::new(AtomicBool::new(false));
 
     // 5. Spawn Core Tasks

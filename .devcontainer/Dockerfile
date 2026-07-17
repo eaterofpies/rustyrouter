@@ -16,7 +16,9 @@ RUN apt-get update \
     less \
     ssh \
     sudo \
-    vim
+    vim \
+    linux-image-cloud-amd64 \
+    xz-utils
 
 RUN rustup component add clippy rustfmt
 

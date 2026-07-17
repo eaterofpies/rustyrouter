@@ -224,3 +224,61 @@ mod tests {
         assert_eq!(*reboot_called, Some(RebootMode::RB_AUTOBOOT));
     }
 }
+
+use std::path::Path;
+
+fn find_module_file(name: &str) -> Option<std::path::PathBuf> {
+    let filename = format!("{}.ko", name);
+    for entry in walkdir::WalkDir::new("/lib/modules")
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_name() == std::ffi::OsStr::new(&filename) {
+            return Some(entry.path().to_path_buf());
+        }
+    }
+    None
+}
+
+fn load_module(path: &Path) -> Result<(), std::io::Error> {
+    println!("[init] Loading kernel module: {:?}", path);
+    let file = fs::File::open(path)?;
+    
+    let param = std::ffi::CString::new("").unwrap();
+    if let Err(e) = nix::kmod::finit_module(&file, &param, nix::kmod::ModuleInitFlags::empty()) {
+        if e != nix::errno::Errno::EEXIST {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
+        }
+    }
+    Ok(())
+}
+
+pub fn load_required_modules() {
+    let modules = [
+        "failover",
+        "net_failover",
+        "virtio_net",
+        "nfnetlink",
+        "libcrc32c",
+        "nf_defrag_ipv4",
+        "nf_defrag_ipv6",
+        "nf_tables",
+        "nf_conntrack",
+        "nf_nat",
+        "nft_ct",
+        "nft_chain_nat",
+        "nft_masq",
+    ];
+
+    for mod_name in &modules {
+        if let Some(path) = find_module_file(mod_name) {
+            if let Err(e) = load_module(&path) {
+                eprintln!("[init] Failed to load module {}: {}", mod_name, e);
+            } else {
+                println!("[init] Successfully loaded module {}", mod_name);
+            }
+        } else {
+            println!("[init] Module {} not found in /lib/modules, assuming built-in or not needed.", mod_name);
+        }
+    }
+}
