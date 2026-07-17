@@ -227,17 +227,31 @@ mod tests {
 
 use std::path::Path;
 
-fn find_module_file(name: &str) -> Option<std::path::PathBuf> {
-    let filename = format!("{}.ko", name);
-    for entry in walkdir::WalkDir::new("/lib/modules")
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_name() == std::ffi::OsStr::new(&filename) {
-            return Some(entry.path().to_path_buf());
+fn find_file_recursive(dir: &Path, filename: &str) -> Option<std::path::PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(found) = check_path(&path, filename) {
+            return Some(found);
         }
     }
     None
+}
+
+fn check_path(path: &Path, filename: &str) -> Option<std::path::PathBuf> {
+    if path.is_dir() {
+        return find_file_recursive(path, filename);
+    }
+    if path.file_name() == Some(std::ffi::OsStr::new(filename)) {
+        return Some(path.to_path_buf());
+    }
+    None
+}
+
+fn find_module_file(name: &str) -> Option<std::path::PathBuf> {
+    let modules_dir = Path::new("/lib/modules");
+    let filename = format!("{}.ko", name);
+    find_file_recursive(modules_dir, &filename)
 }
 
 fn load_module(path: &Path) -> Result<(), std::io::Error> {
@@ -251,6 +265,22 @@ fn load_module(path: &Path) -> Result<(), std::io::Error> {
         }
     }
     Ok(())
+}
+
+fn load_single_module(mod_name: &str) {
+    let path = match find_module_file(mod_name) {
+        Some(p) => p,
+        None => {
+            println!("[init] Module {} not found in /lib/modules, assuming built-in or not needed.", mod_name);
+            return;
+        }
+    };
+
+    if let Err(e) = load_module(&path) {
+        eprintln!("[init] Failed to load module {}: {}", mod_name, e);
+    } else {
+        println!("[init] Successfully loaded module {}", mod_name);
+    }
 }
 
 pub fn load_required_modules() {
@@ -271,14 +301,6 @@ pub fn load_required_modules() {
     ];
 
     for mod_name in &modules {
-        if let Some(path) = find_module_file(mod_name) {
-            if let Err(e) = load_module(&path) {
-                eprintln!("[init] Failed to load module {}: {}", mod_name, e);
-            } else {
-                println!("[init] Successfully loaded module {}", mod_name);
-            }
-        } else {
-            println!("[init] Module {} not found in /lib/modules, assuming built-in or not needed.", mod_name);
-        }
+        load_single_module(mod_name);
     }
 }

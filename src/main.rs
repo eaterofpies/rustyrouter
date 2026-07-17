@@ -1,5 +1,6 @@
 mod config;
 mod network;
+mod netfilter;
 mod reaper;
 mod signal;
 mod system;
@@ -90,6 +91,15 @@ async fn main() {
             &config.lan_ip,
         ).await {
             eprintln!("[init] ERROR: Failed to configure network interfaces: {}", e);
+        }
+
+        if let Err(e) = netfilter::configure_firewall(
+            &config.wan_interface,
+            &config.lan_interface,
+        ) {
+            eprintln!("[init] FATAL: Failed to configure firewall: {}", e);
+            let _ = sys.reboot(RebootMode::RB_AUTOBOOT);
+            return;
         }
     }
 
