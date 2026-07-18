@@ -71,7 +71,7 @@ To allow packets to pass between the interfaces, `rustyrouter` enables IPv4 forw
 #### 2.2.2 Netlink Interface & Route Management (`NETLINK_ROUTE`)
 Using a routing Netlink socket (the standard `rtnetlink` interface), `rustyrouter` performs the following operations asynchronously:
 1. **Loopback Interface (`lo`)**:
-   - Resolves the index of `lo`, sets its link state to `UP` (equivalent to `ip link set lo up`), and assigns the IP address `127.0.0.1/8` to enable internal loopback bindings.
+   - Resolves the index of `lo` and sets its link state to `UP` (equivalent to `ip link set lo up`). The IP address `127.0.0.1/8` is automatically assigned to loopback by the kernel.
 2. **LAN Interface Link & Address**:
    - Sets the LAN interface link state to `UP`.
    - Clears existing IP addresses on the LAN interface.
