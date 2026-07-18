@@ -138,6 +138,13 @@ async fn main() {
         services::start_dhcp_client(client_wan, client_lease).await;
     });
 
+    // Spawn DHCP LAN Server
+    let server_lan = config.lan_interface.clone();
+    let server_lan_ip = config.lan_ip.clone();
+    tokio::spawn(async move {
+        services::start_dhcp_server(server_lan, server_lan_ip).await;
+    });
+
     println!("[init] System startup completed successfully. Entering main event loop.");
 
     // Keep the main thread alive waiting for the signal handler to finish

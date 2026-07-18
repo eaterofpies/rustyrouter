@@ -15,6 +15,7 @@ pnet = "0.35.0"
 socket2 = "0.6.5"
 dhcproto = "0.15.0"
 rand = "0.10.2"
+ipnet = "2.12.0"
 
 
 

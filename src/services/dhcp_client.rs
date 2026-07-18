@@ -1,9 +1,9 @@
 use crate::packet::build_raw_packet;
 use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use tokio::io::unix::AsyncFd;
-use super::utils::{get_interface_mac, open_raw_socket, parse_dhcp_payload, SharedWanLease, WanLease};
+use super::utils::{get_interface_mac, open_raw_socket, parse_dhcp_payload, SharedWanLease, WanLease, read_raw_packet, send_raw_packet};
 
 #[derive(Debug, Clone, PartialEq)]
 enum ClientState {
@@ -377,7 +377,7 @@ async fn send_discover(async_sock: &AsyncFd<RawFd>, mac: MacAddr, xid: u32) {
         &discover_payload,
     );
 
-    send_raw_frame(async_sock, &eth_frame).await;
+    send_raw_packet(async_sock, &eth_frame).await;
     println!("[dhcp-client] Sent DHCPDISCOVER.");
 }
 
@@ -423,7 +423,7 @@ async fn send_request(
         &req_payload,
     );
 
-    send_raw_frame(async_sock, &req_frame).await;
+    send_raw_packet(async_sock, &req_frame).await;
     println!("[dhcp-client] Sent DHCPREQUEST (ciaddr: {}, dest_ip: {}).", ciaddr, dest_ip);
 }
 
@@ -484,72 +484,4 @@ fn parse_lease_options(dhcp: &dhcproto::v4::Message) -> (Ipv4Addr, Option<Ipv4Ad
     };
 
     (mask, gateway, dns, lease_secs)
-}
-
-fn try_read_raw(
-    guard: &mut tokio::io::unix::AsyncFdReadyGuard<'_, std::os::unix::io::RawFd>,
-    buf: &mut [u8],
-) -> Result<Option<usize>, std::io::Error> {
-    match guard.try_io(|inner| {
-        let res = unsafe {
-            libc::recv(inner.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
-        };
-        if res < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(res as usize)
-        }
-    }) {
-        Ok(res) => res.map(Some),
-        Err(_would_block) => Ok(None),
-    }
-}
-
-async fn read_raw_packet(async_sock: &AsyncFd<std::os::unix::io::RawFd>, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-    loop {
-        let mut guard = match async_sock.readable().await {
-            Ok(g) => g,
-            Err(e) => return Err(e),
-        };
-
-        match try_read_raw(&mut guard, buf) {
-            Ok(Some(n)) => return Ok(n),
-            Ok(None) => continue,
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-fn try_write_raw(
-    guard: &mut tokio::io::unix::AsyncFdReadyGuard<'_, std::os::unix::io::RawFd>,
-    frame: &[u8],
-) -> Result<Option<isize>, std::io::Error> {
-    match guard.try_io(|inner| {
-        let res = unsafe {
-            libc::send(inner.as_raw_fd(), frame.as_ptr() as *const libc::c_void, frame.len(), 0)
-        };
-        if res < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(res)
-        }
-    }) {
-        Ok(res) => res.map(Some),
-        Err(_would_block) => Ok(None),
-    }
-}
-
-async fn send_raw_frame(async_sock: &AsyncFd<std::os::unix::io::RawFd>, frame: &[u8]) {
-    loop {
-        let mut guard = match async_sock.writable().await {
-            Ok(g) => g,
-            Err(_) => break,
-        };
-
-        match try_write_raw(&mut guard, frame) {
-            Ok(Some(_)) => break,
-            Ok(None) => continue,
-            Err(_) => break,
-        }
-    }
 }

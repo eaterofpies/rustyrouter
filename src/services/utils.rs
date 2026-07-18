@@ -117,3 +117,72 @@ pub fn parse_dhcp_payload(buf: &[u8], expected_port: u16) -> Option<dhcproto::v4
     }
     Message::decode(&mut Decoder::new(udp_pkt.payload())).ok()
 }
+
+pub fn try_read_raw(
+    guard: &mut tokio::io::unix::AsyncFdReadyGuard<'_, std::os::unix::io::RawFd>,
+    buf: &mut [u8],
+) -> Result<Option<usize>, std::io::Error> {
+    use std::os::unix::io::AsRawFd;
+    match guard.try_io(|inner| {
+        let res = unsafe {
+            libc::recv(inner.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
+        };
+        if res < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(res as usize)
+        }
+    }) {
+        Ok(res) => res.map(Some),
+        Err(_would_block) => Ok(None),
+    }
+}
+
+pub async fn read_raw_packet(
+    async_sock: &tokio::io::unix::AsyncFd<std::os::unix::io::RawFd>,
+    buf: &mut [u8],
+) -> Result<usize, std::io::Error> {
+    loop {
+        let mut guard = async_sock.readable().await?;
+        if let Some(n) = try_read_raw(&mut guard, buf)? {
+            return Ok(n);
+        }
+    }
+}
+
+pub fn try_write_raw(
+    guard: &mut tokio::io::unix::AsyncFdReadyGuard<'_, std::os::unix::io::RawFd>,
+    frame: &[u8],
+) -> Result<Option<isize>, std::io::Error> {
+    use std::os::unix::io::AsRawFd;
+    match guard.try_io(|inner| {
+        let res = unsafe {
+            libc::send(inner.as_raw_fd(), frame.as_ptr() as *const libc::c_void, frame.len(), 0)
+        };
+        if res < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(res)
+        }
+    }) {
+        Ok(res) => res.map(Some),
+        Err(_would_block) => Ok(None),
+    }
+}
+
+pub async fn send_raw_packet(
+    async_sock: &tokio::io::unix::AsyncFd<std::os::unix::io::RawFd>,
+    frame: &[u8],
+) {
+    loop {
+        let mut guard = match async_sock.writable().await {
+            Ok(g) => g,
+            Err(_) => break,
+        };
+
+        match try_write_raw(&mut guard, frame) {
+            Ok(None) => continue,
+            _ => break,
+        }
+    }
+}
