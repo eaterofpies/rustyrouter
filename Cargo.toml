@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.36", features = ["full"] }
-nix = { version = "0.27", features = ["mount", "signal", "process", "reboot", "kmod"] }
+tokio = { version = "1.53.0", features = ["full"] }
+nix = { version = "0.31.3", features = ["mount", "signal", "process", "reboot", "kmod"] }
 libc = "0.2"
-futures-util = "0.3"
+futures-util = "0.3.33"
 evdev = { version = "0.13.2", features = ["tokio", "stream-trait"] }
 rtnetlink = "0.21.0"
 rustables = "0.8.8"
