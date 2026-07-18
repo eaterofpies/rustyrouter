@@ -145,6 +145,12 @@ async fn main() {
         services::start_dhcp_server(server_lan, server_lan_ip).await;
     });
 
+    // Spawn DNS Forwarder
+    let dns_lease = lease_state.clone();
+    tokio::spawn(async move {
+        services::start_dns_forwarder(dns_lease).await;
+    });
+
     println!("[init] System startup completed successfully. Entering main event loop.");
 
     // Keep the main thread alive waiting for the signal handler to finish
