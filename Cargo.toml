@@ -12,6 +12,10 @@ evdev = { version = "0.13.2", features = ["tokio", "stream-trait"] }
 rtnetlink = "0.21.0"
 rustables = "0.8.8"
 pnet = "0.35.0"
+socket2 = "0.6.5"
+dhcproto = "0.15.0"
+rand = "0.10.2"
+
 
 
 

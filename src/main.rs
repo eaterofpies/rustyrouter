@@ -5,6 +5,7 @@ mod reaper;
 mod signal;
 mod system;
 mod packet;
+mod services;
 
 use config::RouterConfig;
 use nix::sys::reboot::RebootMode;
@@ -125,6 +126,16 @@ async fn main() {
     let power_shutdown = shutdown_flag.clone();
     tokio::spawn(async move {
         start_power_button_monitor(power_sys, power_shutdown).await;
+    });
+
+    // Shared state for the DHCP lease obtained on WAN
+    let lease_state = Arc::new(std::sync::Mutex::new(services::WanLease::default()));
+
+    // Spawn DHCP WAN Client
+    let client_wan = config.wan_interface.clone();
+    let client_lease = lease_state.clone();
+    tokio::spawn(async move {
+        services::start_dhcp_client(client_wan, client_lease).await;
     });
 
     println!("[init] System startup completed successfully. Entering main event loop.");
