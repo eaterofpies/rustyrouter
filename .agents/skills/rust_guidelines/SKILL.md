@@ -27,6 +27,8 @@ This skill provides code style and design standards for writing and modifying Ru
 * Write small, highly focused functions that perform a single task.
 * Deconstruct long event loops into simple sequential function calls.
 
-## 5. Always use the latest library versions when writing new code
-* When adding a new crate ensure that it's the latest version available.
-* When making significant changes to code suggest updating the relevant crates if an update is available.
+## 6. Strict Error Handling
+* **Never discard or swallow errors silently** (e.g. using `let _ = ...` or empty `catch`/`unwrap_or` blocks).
+* **Avoid unconditional `unwrap()` or `expect()` calls** in production code, as they trigger abrupt panics. Prefer bubbling up errors using `Result` or `Option` mapping.
+* **Wrap errors in custom error types** (e.g., custom error enums or `thiserror`-like types) where appropriate. This aids calling code with precise identification, categorization, and domain-specific error handling.
+* Critical initialization and configuration errors (such as network interface configuration, packet parsing, or file mounting failures) must cause program failure or transition to a safe panic recovery reboot state rather than continuing in an undefined/broken state.
