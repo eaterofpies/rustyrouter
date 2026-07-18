@@ -126,6 +126,14 @@ All services are implemented directly inside the `rustyrouter` binary using asyn
    - If no DNS servers are provided in the WAN DHCP lease, falls back to the static DNS servers specified on the kernel command line or a compile-time default (e.g., `8.8.8.8`).
    - Maintains a small, in-memory DNS cache.
    - **UDP Only**: Only UDP DNS proxying is supported. TCP DNS queries (including DNSSEC fallback) are unsupported.
+4. **NTP Client**:
+   - Query upstream NTP servers (like `pool.ntp.org` or `time.google.com`) using SNTP (Simple Network Time Protocol) on UDP port 123.
+   - Update the system clock using standard clock-setting system calls (`clock_settime` via the `nix` crate).
+   - Periodically synchronize time (e.g. on startup after WAN IP is obtained, and then periodically).
+
+### 2.4 Logging & Timestamps
+- All standard output and error logs printed by `rustyrouter` must include a standardized timestamp prefix with millisecond resolution.
+- Format: `[YYYY-MM-DD HH:MM:SS.mmm] [module] message` (e.g. `[2026-07-18 15:18:30.123] [init] Mounted /proc successfully.`).
 ---
 
 ## 3. Configuration & Startup Parameters
