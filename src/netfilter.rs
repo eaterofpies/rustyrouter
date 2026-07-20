@@ -1,5 +1,5 @@
 use rustables::{Batch, Chain, MsgType, ProtocolFamily, Table, Hook, HookClass, Rule, ChainPolicy, ChainType};
-use rustables::expr::{Meta, MetaType, Cmp, CmpOp, Masquerade, Immediate, VerdictKind, Conntrack, ConntrackKey, ConnTrackState};
+use rustables::expr::{Meta, MetaType, Cmp, CmpOp, Masquerade, Immediate, VerdictKind, Conntrack, ConntrackKey, ConnTrackState, Bitwise};
 
 fn pad_interface_name(name: &str) -> [u8; 16] {
     let mut bytes = [0u8; 16];
@@ -51,7 +51,8 @@ pub fn configure_firewall(
     let mut ct_rule = Rule::new(&filter_chain)?;
     ct_rule.add_expr(Conntrack::new(ConntrackKey::State));
     let state_mask = ConnTrackState::ESTABLISHED.bits() | ConnTrackState::RELATED.bits();
-    ct_rule.add_expr(Cmp::new(CmpOp::Eq, state_mask.to_be_bytes()));
+    ct_rule.add_expr(Bitwise::new(state_mask.to_le_bytes(), 0u32.to_be_bytes())?);
+    ct_rule.add_expr(Cmp::new(CmpOp::Neq, 0u32.to_be_bytes()));
     ct_rule.add_expr(Immediate::new_verdict(VerdictKind::Accept));
 
     // 6. Rule: Accept input on LAN interface (needed for local services like DNS/DHCP)
