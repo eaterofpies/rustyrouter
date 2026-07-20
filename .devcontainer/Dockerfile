@@ -14,10 +14,12 @@ RUN apt-get update \
     ca-certificates \
     git \
     less \
+    linux-image-cloud-amd64 \
+    make \
+    qemu-system-x86 \
     ssh \
     sudo \
     vim \
-    linux-image-cloud-amd64 \
     xz-utils
 
 RUN rustup component add clippy rustfmt

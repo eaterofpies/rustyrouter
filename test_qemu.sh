@@ -12,7 +12,9 @@ set -e
 KERNEL=""
 if [ -n "$1" ]; then
     KERNEL="$1"
-else
+fi
+
+if [ -z "$KERNEL" ]; then
     echo "[qemu] Searching for a local Linux kernel in /boot..."
     for k in /boot/vmlinuz-$(uname -r) /boot/vmlinuz-* /boot/vmlinux-*; do
         if [ -f "$k" ] && [[ ! "$k" =~ "rescue" ]] && [[ ! "$k" =~ "fallback" ]]; then
@@ -31,19 +33,13 @@ fi
 
 echo "[qemu] Using Linux kernel: $KERNEL"
 
-# Step 2: Verify Initramfs Exists
+# Step 2: Ensure Initramfs is Built/Updated
 INITRAMFS_OUT="target/initramfs.cpio.gz"
-if [ ! -f "$INITRAMFS_OUT" ]; then
-    echo "[qemu] ERROR: $INITRAMFS_OUT not found."
-    echo "Please build the initramfs inside the container first by running:"
-    echo "  ./build_initramfs.sh"
-    exit 1
-fi
+echo "[qemu] Ensuring initramfs is built and up-to-date..."
+make "$INITRAMFS_OUT"
 
-# Step 3: Boot with QEMU
 echo "[qemu] Booting QEMU VM (Ctrl+A then X to exit QEMU)..."
 echo "===================================================="
-
 qemu-system-x86_64 \
   -kernel "$KERNEL" \
   -initrd "$INITRAMFS_OUT" \

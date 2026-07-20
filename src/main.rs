@@ -1,18 +1,18 @@
 mod config;
-mod network;
 mod netfilter;
+mod network;
+mod packet;
 mod reaper;
+mod services;
 mod signal;
 mod system;
-mod packet;
-mod services;
 
 use config::RouterConfig;
 use nix::sys::reboot::RebootMode;
 use nix::unistd::Pid;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use system::{mount_virtual_filesystems, register_panic_handler, RealSystem, SystemOps};
+use std::sync::atomic::AtomicBool;
+use system::{RealSystem, SystemOps, mount_virtual_filesystems, register_panic_handler};
 
 async fn start_power_button_monitor<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<AtomicBool>) {
     println!("[init] Starting ACPI power button monitor...");
@@ -30,7 +30,9 @@ async fn start_power_button_monitor<S: SystemOps>(sys: Arc<S>, shutdown_flag: Ar
                             && event.code() == evdev::KeyCode::KEY_POWER.code()
                             && event.value() == 1
                         {
-                            println!("\n[acpi] Power button pressed. Triggering system shutdown...");
+                            println!(
+                                "\n[acpi] Power button pressed. Triggering system shutdown..."
+                            );
                             shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
                             let _ = sys_clone.reboot(nix::sys::reboot::RebootMode::RB_POWER_OFF);
                             break;
@@ -48,7 +50,11 @@ async fn main() {
 
     // For PID 1, redirect standard descriptors (0, 1, 2) to /dev/console
     if sys.getpid() == Pid::from_raw(1) {
-        if let Ok(console) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/console") {
+        if let Ok(console) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/console")
+        {
             use std::os::unix::io::AsRawFd;
             let fd = console.as_raw_fd();
             unsafe {
@@ -87,18 +93,18 @@ async fn main() {
 
     // 4. Configure Network Interfaces (lo, LAN, WAN)
     if sys.getpid() == Pid::from_raw(1) {
-        if let Err(e) = network::configure_network(
-            &config.wan_interface,
-            &config.lan_interface,
-            &config.lan_ip,
-        ).await {
-            eprintln!("[init] ERROR: Failed to configure network interfaces: {}", e);
+        if let Err(e) =
+            network::configure_network(&config.wan_interface, &config.lan_interface, &config.lan_ip)
+                .await
+        {
+            eprintln!(
+                "[init] ERROR: Failed to configure network interfaces: {}",
+                e
+            );
         }
 
-        if let Err(e) = netfilter::configure_firewall(
-            &config.wan_interface,
-            &config.lan_interface,
-        ) {
+        if let Err(e) = netfilter::configure_firewall(&config.wan_interface, &config.lan_interface)
+        {
             eprintln!("[init] FATAL: Failed to configure firewall: {}", e);
             let _ = sys.reboot(RebootMode::RB_AUTOBOOT);
             return;

@@ -4,6 +4,7 @@ use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;
 use tokio::io::unix::AsyncFd;
 use super::utils::{get_interface_mac, open_raw_socket, parse_dhcp_payload, SharedWanLease, WanLease, read_raw_packet, send_raw_packet};
+use futures_util::TryStreamExt;
 
 #[derive(Debug, Clone, PartialEq)]
 enum ClientState {
@@ -175,7 +176,9 @@ async fn handle_state_tick(
             let elapsed = bound_at.elapsed().as_secs() as u32;
             if elapsed >= *lease_secs {
                 println!("[dhcp-client] Lease expired!");
-                deconfigure_wan(wan_interface, *ip, *mask);
+                if let Err(e) = deconfigure_wan(wan_interface, *ip, *mask).await {
+                    println!("[dhcp-client] ERROR: Failed to deconfigure WAN interface via netlink: {}", e);
+                }
                 let mut lease = lease_state.lock().unwrap();
                 *lease = WanLease::default();
                 *state = ClientState::Discovering {
@@ -282,7 +285,10 @@ async fn handle_incoming_packet(
         _ => return,
     };
 
-    let eth = pnet::packet::ethernet::EthernetPacket::new(&buf[..bytes_read]).unwrap();
+    let eth = match pnet::packet::ethernet::EthernetPacket::new(&buf[..bytes_read]) {
+        Some(p) => p,
+        None => return,
+    };
     let server_mac = eth.get_source();
 
     if msg_type == dhcproto::v4::MessageType::Offer {
@@ -302,11 +308,11 @@ async fn handle_incoming_packet(
     }
 
     if msg_type == dhcproto::v4::MessageType::Ack {
-        handle_ack_received(dhcp, server_mac, state, lease_state, wan_interface);
+        handle_ack_received(dhcp, server_mac, state, lease_state, wan_interface).await;
     }
 }
 
-fn handle_ack_received(
+async fn handle_ack_received(
     dhcp: dhcproto::v4::Message,
     server_mac: MacAddr,
     state: &mut ClientState,
@@ -319,19 +325,27 @@ fn handle_ack_received(
     let server_ip = get_server_identifier(&dhcp);
 
     // Check if we need to configure/reconfigure
-    let mut lease = lease_state.lock().unwrap();
-    let changed = lease.ip != Some(ip)
-        || lease.mask != Some(mask)
-        || lease.gateway != gateway
-        || lease.dns_servers != dns_servers;
+    let changed = {
+        let mut lease = lease_state.lock().unwrap();
+        let changed = lease.ip != Some(ip)
+            || lease.mask != Some(mask)
+            || lease.gateway != gateway
+            || lease.dns_servers != dns_servers;
+
+        if changed {
+            lease.ip = Some(ip);
+            lease.mask = Some(mask);
+            lease.gateway = gateway;
+            lease.dns_servers = dns_servers;
+            println!("[dhcp-client] Lease parameters updated: {:?}", *lease);
+        }
+        changed
+    };
 
     if changed {
-        lease.ip = Some(ip);
-        lease.mask = Some(mask);
-        lease.gateway = gateway;
-        lease.dns_servers = dns_servers;
-        println!("[dhcp-client] Lease parameters updated: {:?}", *lease);
-        configure_wan(wan_interface, ip, mask, gateway);
+        if let Err(e) = configure_wan(wan_interface, ip, mask, gateway).await {
+            println!("[dhcp-client] ERROR: Failed to configure WAN interface via netlink: {}", e);
+        }
     }
 
     *state = ClientState::Bound {
@@ -365,7 +379,10 @@ async fn send_discover(async_sock: &AsyncFd<RawFd>, mac: MacAddr, xid: u32) {
     ]));
 
     let mut discover_payload = Vec::new();
-    discover.encode(&mut Encoder::new(&mut discover_payload)).unwrap();
+    if let Err(e) = discover.encode(&mut Encoder::new(&mut discover_payload)) {
+        println!("[dhcp-client] ERROR: Failed to encode DHCPDISCOVER payload: {}", e);
+        return;
+    }
 
     let eth_frame = build_raw_packet(
         mac,
@@ -411,7 +428,10 @@ async fn send_request(
     request.opts_mut().insert(DhcpOption::MessageType(MessageType::Request));
 
     let mut req_payload = Vec::new();
-    request.encode(&mut Encoder::new(&mut req_payload)).unwrap();
+    if let Err(e) = request.encode(&mut Encoder::new(&mut req_payload)) {
+        println!("[dhcp-client] ERROR: Failed to encode DHCPREQUEST payload: {}", e);
+        return;
+    }
 
     let req_frame = build_raw_packet(
         mac,
@@ -427,29 +447,93 @@ async fn send_request(
     println!("[dhcp-client] Sent DHCPREQUEST (ciaddr: {}, dest_ip: {}).", ciaddr, dest_ip);
 }
 
-fn deconfigure_wan(wan_interface: &str, ip: Ipv4Addr, mask: Ipv4Addr) {
+async fn deconfigure_wan(
+    wan_interface: &str,
+    ip: Ipv4Addr,
+    mask: Ipv4Addr,
+) -> Result<(), Box<dyn std::error::Error>> {
     let prefix_len = mask.octets().iter().map(|&x| x.count_ones()).sum::<u32>() as u8;
-    println!("[dhcp-client] Deconfiguring WAN interface: removing IP {}/{}", ip, prefix_len);
-    let ip_cmd = format!("ip addr del {}/{} dev {}", ip, prefix_len, wan_interface);
-    let _ = std::process::Command::new("sh").arg("-c").arg(&ip_cmd).status();
-    let route_cmd = format!("ip route flush dev {}", wan_interface);
-    let _ = std::process::Command::new("sh").arg("-c").arg(&route_cmd).status();
+    println!("[dhcp-client] Deconfiguring WAN interface via netlink: removing IP {}/{}", ip, prefix_len);
+
+    let (connection, handle, _) = rtnetlink::new_connection()?;
+    tokio::spawn(connection);
+
+    let mut links = handle.link().get().match_name(wan_interface.to_string()).execute();
+    let link = match links.try_next().await? {
+        Some(l) => l,
+        None => return Err(format!("Interface {} not found", wan_interface).into()),
+    };
+    let index = link.header.index;
+
+    // Filter and delete the matching address
+    let mut addresses = handle.address().get().execute();
+    while let Some(addr) = addresses.try_next().await? {
+        if addr.header.index == index {
+            let mut matches_ip = false;
+            for nla in addr.attributes.iter() {
+                if let rtnetlink::packet_route::address::AddressAttribute::Local(ip_attr) = nla {
+                    if ip_attr == &std::net::IpAddr::V4(ip) {
+                        matches_ip = true;
+                        break;
+                    }
+                }
+            }
+            if matches_ip {
+                let _ = handle.address().del(addr).execute().await;
+            }
+        }
+    }
+    Ok(())
 }
 
-fn configure_wan(wan_interface: &str, ip: Ipv4Addr, mask: Ipv4Addr, gateway: Option<Ipv4Addr>) {
+async fn configure_wan(
+    wan_interface: &str,
+    ip: Ipv4Addr,
+    mask: Ipv4Addr,
+    gateway: Option<Ipv4Addr>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let prefix_len = mask.octets().iter().map(|&x| x.count_ones()).sum::<u32>() as u8;
-    println!("[dhcp-client] Configuring WAN interface: IP={}/{}, Gateway={:?}", ip, prefix_len, gateway);
-    
-    let flush_cmd = format!("ip addr flush dev {}", wan_interface);
-    let _ = std::process::Command::new("sh").arg("-c").arg(&flush_cmd).status();
+    println!(
+        "[dhcp-client] Configuring WAN interface via netlink: IP={}/{}, Gateway={:?}",
+        ip, prefix_len, gateway
+    );
 
-    let ip_cmd = format!("ip addr add {}/{} dev {}", ip, prefix_len, wan_interface);
-    let _ = std::process::Command::new("sh").arg("-c").arg(&ip_cmd).status();
+    let (connection, handle, _) = rtnetlink::new_connection()?;
+    tokio::spawn(connection);
 
-    if let Some(gw) = gateway {
-        let route_cmd = format!("ip route add default via {} dev {}", gw, wan_interface);
-        let _ = std::process::Command::new("sh").arg("-c").arg(&route_cmd).status();
+    let mut links = handle.link().get().match_name(wan_interface.to_string()).execute();
+    let link = match links.try_next().await? {
+        Some(l) => l,
+        None => return Err(format!("Interface {} not found", wan_interface).into()),
+    };
+    let index = link.header.index;
+
+    // Flush existing addresses on WAN first
+    let mut addresses = handle.address().get().execute();
+    while let Some(addr) = addresses.try_next().await? {
+        if addr.header.index == index {
+            let _ = handle.address().del(addr).execute().await;
+        }
     }
+
+    // Set link state UP (if not already)
+    let message = rtnetlink::LinkUnspec::new_with_index(index).up().build();
+    handle.link().change(message).execute().await?;
+
+    // Add new IP
+    handle.address().add(index, std::net::IpAddr::V4(ip), prefix_len).execute().await?;
+
+    // Add default route
+    if let Some(gw) = gateway {
+        let route = rtnetlink::RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(Ipv4Addr::new(0, 0, 0, 0), 0)
+            .gateway(gw)
+            .output_interface(index)
+            .build();
+        let _ = handle.route().add(route).execute().await;
+    }
+
+    Ok(())
 }
 
 fn get_server_identifier(dhcp: &dhcproto::v4::Message) -> Option<Ipv4Addr> {

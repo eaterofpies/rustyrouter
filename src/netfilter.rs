@@ -60,6 +60,9 @@ pub fn configure_firewall(
     lan_rule.add_expr(Cmp::new(CmpOp::Eq, pad_interface_name(lan_iface)));
     lan_rule.add_expr(Immediate::new_verdict(VerdictKind::Accept));
 
+    // 6.5. Rule: Accept ICMP on all interfaces (allows external/internal pings)
+    let icmp_rule = Rule::new(&filter_chain)?.icmp().accept();
+
     // 7. Send configuration batch to the kernel
     let mut batch = Batch::new();
     batch.add(&table, MsgType::Add);
@@ -68,6 +71,7 @@ pub fn configure_firewall(
     batch.add(&masq_rule, MsgType::Add);
     batch.add(&lo_rule, MsgType::Add);
     batch.add(&lan_rule, MsgType::Add);
+    batch.add(&icmp_rule, MsgType::Add);
     batch.add(&ct_rule, MsgType::Add);
 
     batch.send()?;
