@@ -6,6 +6,10 @@ use std::net::Ipv4Addr;
 use std::net::UdpSocket as StdUdpSocket;
 use tokio::net::UdpSocket;
 
+const DEFAULT_LEASE_SECS: u32 = 3600;
+const MAX_RETRY_DELAY_SECS: u32 = 64;
+const INITIAL_RETRY_DELAY_SECS: u32 = 4;
+
 struct DhcpOffer {
     offered_ip: Ipv4Addr,
     server_ip: Option<Ipv4Addr>,
@@ -20,6 +24,12 @@ struct DhcpAck {
     dns_servers: Vec<Ipv4Addr>,
 }
 
+enum ParseAckResult {
+    Ack(DhcpAck),
+    Nak,
+    None,
+}
+
 struct DhcpClient {
     socket: UdpSocket,
     mac: MacAddr,
@@ -28,7 +38,12 @@ struct DhcpClient {
 }
 
 impl DhcpClient {
-    fn new(socket: UdpSocket, mac: MacAddr, lease_state: SharedWanLease, wan_interface: String) -> Self {
+    fn new(
+        socket: UdpSocket,
+        mac: MacAddr,
+        lease_state: SharedWanLease,
+        wan_interface: String,
+    ) -> Self {
         Self {
             socket,
             mac,
@@ -43,7 +58,10 @@ impl DhcpClient {
             let (xid, offer) = match self.discover_phase().await {
                 Ok(res) => res,
                 Err(e) => {
-                    println!("[dhcp-client] Discover phase failed: {}. Retrying in 5s...", e);
+                    println!(
+                        "[dhcp-client] Discover phase failed: {}. Retrying in 5s...",
+                        e
+                    );
                     self.deconfigure().await;
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
@@ -54,7 +72,10 @@ impl DhcpClient {
             let ack = match self.request_phase(xid, offer).await {
                 Ok(res) => res,
                 Err(e) => {
-                    println!("[dhcp-client] Request phase failed: {}. Restarting negotiation in 5s...", e);
+                    println!(
+                        "[dhcp-client] Request phase failed: {}. Restarting negotiation in 5s...",
+                        e
+                    );
                     self.deconfigure().await;
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
@@ -63,14 +84,19 @@ impl DhcpClient {
 
             // 3. Bound Phase: Configure IP, wait, and periodically renew
             if let Err(e) = self.bound_phase(ack).await {
-                println!("[dhcp-client] Bound phase exited: {}. Restarting negotiation...", e);
+                println!(
+                    "[dhcp-client] Bound phase exited: {}. Restarting negotiation...",
+                    e
+                );
             }
         }
     }
 
-    async fn discover_phase(&self) -> Result<(u32, DhcpOffer), Box<dyn std::error::Error + Send + Sync>> {
+    async fn discover_phase(
+        &self,
+    ) -> Result<(u32, DhcpOffer), Box<dyn std::error::Error + Send + Sync>> {
         let xid = rand::random::<u32>();
-        let mut retry_delay_secs = 4;
+        let mut retry_delay_secs = INITIAL_RETRY_DELAY_SECS;
         let mut buf = [0u8; 2048];
 
         loop {
@@ -85,29 +111,17 @@ impl DhcpClient {
                     break;
                 }
 
-                let read_res = tokio::time::timeout(remaining, self.socket.recv_from(&mut buf)).await;
-                match read_res {
-                    Ok(Ok((n, _src))) => {
-                        use dhcproto::{Decoder, Decodable};
-                        use dhcproto::v4::{Message, MessageType, OptionCode, DhcpOption};
-
-                        if let Ok(dhcp) = Message::decode(&mut Decoder::new(&buf[..n])) {
-                            if dhcp.xid() == xid {
-                                let msg_type = dhcp.opts().get(OptionCode::MessageType);
-                                if let Some(DhcpOption::MessageType(MessageType::Offer)) = msg_type {
-                                    let offered_ip = dhcp.yiaddr();
-                                    let server_ip = get_server_identifier(&dhcp);
-                                    println!(
-                                        "[dhcp-client] Received DHCPOFFER for IP: {}, server: {:?}",
-                                        offered_ip, server_ip
-                                    );
-                                    return Ok((xid, DhcpOffer { offered_ip, server_ip }));
-                                }
-                            }
+                match self.receive_packet(&mut buf, remaining).await? {
+                    Some(n) => {
+                        if let Some(offer) = parse_offer(&buf[..n], xid) {
+                            println!(
+                                "[dhcp-client] Received DHCPOFFER for IP: {}, server: {:?}",
+                                offer.offered_ip, offer.server_ip
+                            );
+                            return Ok((xid, offer));
                         }
                     }
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(_) => break, // Timeout, trigger retry loop
+                    None => break, // Timeout, trigger retry loop
                 }
             }
 
@@ -115,8 +129,12 @@ impl DhcpClient {
         }
     }
 
-    async fn request_phase(&self, xid: u32, offer: DhcpOffer) -> Result<DhcpAck, Box<dyn std::error::Error + Send + Sync>> {
-        let mut retry_delay_secs = 4;
+    async fn request_phase(
+        &self,
+        xid: u32,
+        offer: DhcpOffer,
+    ) -> Result<DhcpAck, Box<dyn std::error::Error + Send + Sync>> {
+        let mut retry_delay_secs = INITIAL_RETRY_DELAY_SECS;
         let mut buf = [0u8; 2048];
 
         loop {
@@ -138,41 +156,19 @@ impl DhcpClient {
                     break;
                 }
 
-                let read_res = tokio::time::timeout(remaining, self.socket.recv_from(&mut buf)).await;
-                match read_res {
-                    Ok(Ok((n, _src))) => {
-                        use dhcproto::{Decoder, Decodable};
-                        use dhcproto::v4::{Message, MessageType, OptionCode, DhcpOption};
-
-                        if let Ok(dhcp) = Message::decode(&mut Decoder::new(&buf[..n])) {
-                            if dhcp.xid() == xid {
-                                let msg_type = dhcp.opts().get(OptionCode::MessageType);
-                                match msg_type {
-                                    Some(DhcpOption::MessageType(MessageType::Ack)) => {
-                                        let (mask, gateway, dns_servers, lease_secs) = parse_lease_options(&dhcp);
-                                        let ip = dhcp.yiaddr();
-                                        let server_ip = get_server_identifier(&dhcp);
-                                        println!("[dhcp-client] Received DHCPACK for IP: {}", ip);
-                                        return Ok(DhcpAck {
-                                            ip,
-                                            mask,
-                                            gateway,
-                                            server_ip,
-                                            lease_secs,
-                                            dns_servers,
-                                        });
-                                    }
-                                    Some(DhcpOption::MessageType(MessageType::Nak)) => {
-                                        println!("[dhcp-client] Received DHCPNAK!");
-                                        return Err("DHCPNAK received".into());
-                                    }
-                                    _ => {}
-                                }
-                            }
+                match self.receive_packet(&mut buf, remaining).await? {
+                    Some(n) => match parse_ack_nak(&buf[..n], xid) {
+                        ParseAckResult::Ack(ack) => {
+                            println!("[dhcp-client] Received DHCPACK for IP: {}", ack.ip);
+                            return Ok(ack);
                         }
-                    }
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(_) => break, // Timeout, trigger retry loop
+                        ParseAckResult::Nak => {
+                            println!("[dhcp-client] Received DHCPNAK!");
+                            return Err("DHCPNAK received".into());
+                        }
+                        ParseAckResult::None => {}
+                    },
+                    None => break, // Timeout, trigger retry loop
                 }
             }
 
@@ -180,7 +176,10 @@ impl DhcpClient {
         }
     }
 
-    async fn bound_phase(&self, ack: DhcpAck) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn bound_phase(
+        &self,
+        ack: DhcpAck,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut ip = ack.ip;
         let mut mask = ack.mask;
         let mut gateway = ack.gateway;
@@ -188,7 +187,8 @@ impl DhcpClient {
         let mut lease_secs = ack.lease_secs;
         let mut server_ip = ack.server_ip;
 
-        self.apply_lease_config(ip, mask, gateway, &dns_servers).await?;
+        self.apply_lease_config(ip, mask, gateway, &dns_servers)
+            .await?;
         let mut bound_at = std::time::Instant::now();
 
         loop {
@@ -207,7 +207,7 @@ impl DhcpClient {
                 continue;
             }
 
-            // T2 Rebinding time is 87.5% of lease
+            // T2 Rebinding time is 87.5% of lease (RFC 2131 section 4.4.5)
             let t2_secs = (lease_secs as f64 * 0.875) as u32;
 
             // Enter renewal loop
@@ -244,7 +244,9 @@ impl DhcpClient {
                         println!("[dhcp-client] REBINDING: sending broadcast DHCPREQUEST...");
                         self.send_request(renew_xid, ip, None, ip, dest_ip).await;
                     } else {
-                        println!("[dhcp-client] RENEWING: sending unicast DHCPREQUEST to server...");
+                        println!(
+                            "[dhcp-client] RENEWING: sending unicast DHCPREQUEST to server..."
+                        );
                         self.send_request(renew_xid, ip, None, ip, dest_ip).await;
                     }
                     renew_sent = Some(std::time::Instant::now());
@@ -252,47 +254,62 @@ impl DhcpClient {
 
                 // Listen for ACK during this interval
                 let listen_timeout = std::time::Duration::from_secs(retry_interval as u64);
-                let read_res = tokio::time::timeout(listen_timeout, self.socket.recv_from(&mut buf)).await;
-                match read_res {
-                    Ok(Ok((n, _src))) => {
-                        use dhcproto::{Decoder, Decodable};
-                        use dhcproto::v4::{Message, MessageType, OptionCode, DhcpOption};
+                if let Some(n) = self.receive_packet(&mut buf, listen_timeout).await? {
+                    match parse_ack_nak(&buf[..n], renew_xid) {
+                        ParseAckResult::Ack(new_ack) => {
+                            println!("[dhcp-client] Renewal successful!");
+                            ip = new_ack.ip;
+                            mask = new_ack.mask;
+                            gateway = new_ack.gateway;
+                            dns_servers = new_ack.dns_servers;
+                            lease_secs = new_ack.lease_secs;
+                            server_ip = new_ack.server_ip;
 
-                        if let Ok(dhcp) = Message::decode(&mut Decoder::new(&buf[..n])) {
-                            if dhcp.xid() == renew_xid {
-                                let msg_type = dhcp.opts().get(OptionCode::MessageType);
-                                match msg_type {
-                                    Some(DhcpOption::MessageType(MessageType::Ack)) => {
-                                        println!("[dhcp-client] Renewal successful!");
-                                        let (new_mask, new_gateway, new_dns, new_lease_secs) = parse_lease_options(&dhcp);
-                                        let new_ip = dhcp.yiaddr();
-
-                                        ip = new_ip;
-                                        mask = new_mask;
-                                        gateway = new_gateway;
-                                        dns_servers = new_dns;
-                                        lease_secs = new_lease_secs;
-                                        server_ip = get_server_identifier(&dhcp);
-
-                                        self.apply_lease_config(ip, mask, gateway, &dns_servers).await?;
-                                        bound_at = std::time::Instant::now();
-                                        break; // Escape renewal retry loop, restart bound loop with updated parameters
-                                    }
-                                    Some(DhcpOption::MessageType(MessageType::Nak)) => {
-                                        println!("[dhcp-client] Renewal NAK'd!");
-                                        self.deconfigure().await;
-                                        return Err("Lease renewal NAK'd".into());
-                                    }
-                                    _ => {}
-                                }
-                            }
+                            self.apply_lease_config(ip, mask, gateway, &dns_servers)
+                                .await?;
+                            bound_at = std::time::Instant::now();
+                            break; // Escape renewal retry loop, restart bound loop with updated parameters
                         }
+                        ParseAckResult::Nak => {
+                            println!("[dhcp-client] Renewal NAK'd!");
+                            self.deconfigure().await;
+                            return Err("Lease renewal NAK'd".into());
+                        }
+                        ParseAckResult::None => {}
                     }
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(_) => {} // Timeout, retry loop will continue and trigger sending again if needed
                 }
             }
         }
+    }
+
+    async fn receive_packet(
+        &self,
+        buf: &mut [u8],
+        timeout: std::time::Duration,
+    ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
+        let read_res = tokio::time::timeout(timeout, self.socket.recv_from(buf)).await;
+        match read_res {
+            Ok(Ok((n, _src))) => Ok(Some(n)),
+            Ok(Err(e)) => Err(e.into()),
+            Err(_) => Ok(None), // Timeout
+        }
+    }
+
+    async fn send_dhcp_message(
+        &self,
+        message: dhcproto::v4::Message,
+        dest_ip: Ipv4Addr,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use dhcproto::{Encodable, Encoder};
+        let mut payload = Vec::new();
+        message.encode(&mut Encoder::new(&mut payload))?;
+
+        let dest_addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+            dest_ip,
+            dhcproto::v4::SERVER_PORT,
+        ));
+        self.socket.send_to(&payload, dest_addr).await?;
+        Ok(())
     }
 
     async fn apply_lease_config(
@@ -334,27 +351,25 @@ impl DhcpClient {
             (ip, mask)
         };
 
-        if let Some(ip) = ip {
-            if let Some(mask) = mask {
-                if let Err(e) = deconfigure_wan(&self.wan_interface, ip, mask).await {
-                    println!(
-                        "[dhcp-client] ERROR: Failed to deconfigure WAN interface via netlink: {}",
-                        e
-                    );
-                }
-            }
+        if let Some(ip) = ip
+            && let Some(mask) = mask
+            && let Err(e) = deconfigure_wan(&self.wan_interface, ip, mask).await
+        {
+            println!(
+                "[dhcp-client] ERROR: Failed to deconfigure WAN interface via netlink: {}",
+                e
+            );
         }
     }
 
     async fn send_discover(&self, xid: u32) {
         use dhcproto::v4::{DhcpOption, Flags, Message, MessageType, Opcode, OptionCode};
-        use dhcproto::{Encodable, Encoder};
 
         let mut discover = Message::default();
         discover.set_opcode(Opcode::BootRequest);
         discover.set_xid(xid);
         discover.set_flags(Flags::default().set_broadcast());
-        discover.set_chaddr(&[self.mac.0, self.mac.1, self.mac.2, self.mac.3, self.mac.4, self.mac.5]);
+        discover.set_chaddr(&self.mac.octets());
 
         discover
             .opts_mut()
@@ -367,16 +382,7 @@ impl DhcpClient {
                 OptionCode::DomainNameServer,
             ]));
 
-        let mut discover_payload = Vec::new();
-        if let Err(e) = discover.encode(&mut Encoder::new(&mut discover_payload)) {
-            println!(
-                "[dhcp-client] ERROR: Failed to encode DHCPDISCOVER payload: {}",
-                e
-            );
-            return;
-        }
-
-        if let Err(e) = self.socket.send_to(&discover_payload, "255.255.255.255:67").await {
+        if let Err(e) = self.send_dhcp_message(discover, Ipv4Addr::BROADCAST).await {
             println!("[dhcp-client] ERROR: Failed to send DHCPDISCOVER: {}", e);
         } else {
             println!("[dhcp-client] Sent DHCPDISCOVER.");
@@ -392,13 +398,12 @@ impl DhcpClient {
         dest_ip: Ipv4Addr,
     ) {
         use dhcproto::v4::{DhcpOption, Flags, Message, MessageType, Opcode};
-        use dhcproto::{Encodable, Encoder};
 
         let mut request = Message::default();
         request.set_opcode(Opcode::BootRequest);
         request.set_xid(xid);
         request.set_ciaddr(ciaddr);
-        request.set_chaddr(&[self.mac.0, self.mac.1, self.mac.2, self.mac.3, self.mac.4, self.mac.5]);
+        request.set_chaddr(&self.mac.octets());
 
         if ciaddr.is_unspecified() {
             request.set_flags(Flags::default().set_broadcast());
@@ -414,17 +419,7 @@ impl DhcpClient {
             .opts_mut()
             .insert(DhcpOption::MessageType(MessageType::Request));
 
-        let mut req_payload = Vec::new();
-        if let Err(e) = request.encode(&mut Encoder::new(&mut req_payload)) {
-            println!(
-                "[dhcp-client] ERROR: Failed to encode DHCPREQUEST payload: {}",
-                e
-            );
-            return;
-        }
-
-        let dest_addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(dest_ip, 67));
-        if let Err(e) = self.socket.send_to(&req_payload, dest_addr).await {
+        if let Err(e) = self.send_dhcp_message(request, dest_ip).await {
             println!("[dhcp-client] ERROR: Failed to send DHCPREQUEST: {}", e);
         } else {
             println!(
@@ -482,7 +477,11 @@ pub async fn start_dhcp_client(wan_interface: String, lease_state: SharedWanLeas
 
 fn calculate_next_delay(current_delay: u32) -> u32 {
     let doubled = current_delay * 2;
-    if doubled > 64 { 64 } else { doubled }
+    if doubled > MAX_RETRY_DELAY_SECS {
+        MAX_RETRY_DELAY_SECS
+    } else {
+        doubled
+    }
 }
 
 fn get_jittered_duration(base_secs: u32) -> std::time::Duration {
@@ -492,6 +491,55 @@ fn get_jittered_duration(base_secs: u32) -> std::time::Duration {
         std::time::Duration::from_secs(1),
         std::time::Duration::from_secs_f64(secs),
     )
+}
+
+fn parse_offer(buf: &[u8], xid: u32) -> Option<DhcpOffer> {
+    use dhcproto::v4::{DhcpOption, Message, MessageType, OptionCode};
+    use dhcproto::{Decodable, Decoder};
+
+    let dhcp = Message::decode(&mut Decoder::new(buf)).ok()?;
+    if dhcp.xid() != xid {
+        return None;
+    }
+    let msg_type = dhcp.opts().get(OptionCode::MessageType)?;
+    if let DhcpOption::MessageType(MessageType::Offer) = msg_type {
+        let offered_ip = dhcp.yiaddr();
+        let server_ip = get_server_identifier(&dhcp);
+        Some(DhcpOffer {
+            offered_ip,
+            server_ip,
+        })
+    } else {
+        None
+    }
+}
+
+fn parse_ack_nak(buf: &[u8], xid: u32) -> ParseAckResult {
+    use dhcproto::v4::{DhcpOption, Message, MessageType, OptionCode};
+    use dhcproto::{Decodable, Decoder};
+
+    let dhcp = match Message::decode(&mut Decoder::new(buf)) {
+        Ok(d) => d,
+        Err(_) => return ParseAckResult::None,
+    };
+    if dhcp.xid() != xid {
+        return ParseAckResult::None;
+    }
+    match dhcp.opts().get(OptionCode::MessageType) {
+        Some(DhcpOption::MessageType(MessageType::Ack)) => {
+            let (mask, gateway, dns_servers, lease_secs) = parse_lease_options(&dhcp);
+            ParseAckResult::Ack(DhcpAck {
+                ip: dhcp.yiaddr(),
+                mask,
+                gateway,
+                server_ip: get_server_identifier(&dhcp),
+                lease_secs,
+                dns_servers,
+            })
+        }
+        Some(DhcpOption::MessageType(MessageType::Nak)) => ParseAckResult::Nak,
+        _ => ParseAckResult::None,
+    }
 }
 
 async fn deconfigure_wan(
@@ -532,8 +580,8 @@ async fn deconfigure_wan(
                     break;
                 }
             }
-            if matches_ip {
-                let _ = handle.address().del(addr).execute().await;
+            if matches_ip && let Err(e) = handle.address().del(addr).execute().await {
+                println!("[dhcp-client] WARNING: Failed to delete IP address: {}", e);
             }
         }
     }
@@ -592,7 +640,9 @@ async fn configure_wan(
             .gateway(gw)
             .output_interface(index)
             .build();
-        let _ = handle.route().add(route).execute().await;
+        if let Err(e) = handle.route().add(route).execute().await {
+            println!("[dhcp-client] WARNING: Failed to add default route: {}", e);
+        }
     }
 
     Ok(())
@@ -628,7 +678,7 @@ fn parse_lease_options(
 
     let lease_secs = match dhcp.opts().get(OptionCode::AddressLeaseTime) {
         Some(DhcpOption::AddressLeaseTime(t)) => *t,
-        _ => 3600,
+        _ => DEFAULT_LEASE_SECS,
     };
 
     (mask, gateway, dns, lease_secs)
@@ -636,7 +686,7 @@ fn parse_lease_options(
 
 fn make_client_socket(interface_name: &str) -> std::io::Result<UdpSocket> {
     // Bind to 0.0.0.0 because the client doesn't have an IP address yet.
-    let std_socket = StdUdpSocket::bind("0.0.0.0:68")?;
+    let std_socket = StdUdpSocket::bind(("0.0.0.0", dhcproto::v4::CLIENT_PORT))?;
 
     // Allow broadcast on the interface
     setsockopt(&std_socket, sockopt::Broadcast, &true).map_err(std::io::Error::from)?;

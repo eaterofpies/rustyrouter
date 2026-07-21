@@ -83,7 +83,7 @@ pub fn configure_firewall(
         ))
         .build(),
     );
-    wan_dhcp_rule.add_expr(Cmp::new(CmpOp::Eq, (dhcproto::v4::CLIENT_PORT as u16).to_be_bytes()));
+    wan_dhcp_rule.add_expr(Cmp::new(CmpOp::Eq, dhcproto::v4::CLIENT_PORT.to_be_bytes()));
     wan_dhcp_rule.add_expr(Immediate::new_verdict(VerdictKind::Accept));
 
     // 6.5. Rule: Accept ICMP on all interfaces (allows external/internal pings)
