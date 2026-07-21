@@ -97,32 +97,17 @@ impl DhcpClient {
     ) -> Result<(u32, DhcpOffer), Box<dyn std::error::Error + Send + Sync>> {
         let xid = rand::random::<u32>();
         let mut retry_delay_secs = INITIAL_RETRY_DELAY_SECS;
-        let mut buf = [0u8; 2048];
 
         loop {
             self.send_discover(xid).await;
-            let last_sent = std::time::Instant::now();
-            let timeout_duration = get_jittered_duration(retry_delay_secs);
+            let timeout = get_jittered_duration(retry_delay_secs);
 
-            // Wait for matching DHCPOFFER
-            while last_sent.elapsed() < timeout_duration {
-                let remaining = timeout_duration.saturating_sub(last_sent.elapsed());
-                if remaining.is_zero() {
-                    break;
-                }
-
-                match self.receive_packet(&mut buf, remaining).await? {
-                    Some(n) => {
-                        if let Some(offer) = parse_offer(&buf[..n], xid) {
-                            println!(
-                                "[dhcp-client] Received DHCPOFFER for IP: {}, server: {:?}",
-                                offer.offered_ip, offer.server_ip
-                            );
-                            return Ok((xid, offer));
-                        }
-                    }
-                    None => break, // Timeout, trigger retry loop
-                }
+            if let Some(offer) = self.wait_for_offer(xid, timeout).await? {
+                println!(
+                    "[dhcp-client] Received DHCPOFFER for IP: {}, server: {:?}",
+                    offer.offered_ip, offer.server_ip
+                );
+                return Ok((xid, offer));
             }
 
             retry_delay_secs = calculate_next_delay(retry_delay_secs);
@@ -135,7 +120,6 @@ impl DhcpClient {
         offer: DhcpOffer,
     ) -> Result<DhcpAck, Box<dyn std::error::Error + Send + Sync>> {
         let mut retry_delay_secs = INITIAL_RETRY_DELAY_SECS;
-        let mut buf = [0u8; 2048];
 
         loop {
             self.send_request(
@@ -146,29 +130,19 @@ impl DhcpClient {
                 Ipv4Addr::BROADCAST,
             )
             .await;
-            let last_sent = std::time::Instant::now();
-            let timeout_duration = get_jittered_duration(retry_delay_secs);
+            let timeout = get_jittered_duration(retry_delay_secs);
 
-            // Wait for matching DHCPACK
-            while last_sent.elapsed() < timeout_duration {
-                let remaining = timeout_duration.saturating_sub(last_sent.elapsed());
-                if remaining.is_zero() {
-                    break;
-                }
-
-                match self.receive_packet(&mut buf, remaining).await? {
-                    Some(n) => match parse_ack_nak(&buf[..n], xid) {
-                        ParseAckResult::Ack(ack) => {
-                            println!("[dhcp-client] Received DHCPACK for IP: {}", ack.ip);
-                            return Ok(ack);
-                        }
-                        ParseAckResult::Nak => {
-                            println!("[dhcp-client] Received DHCPNAK!");
-                            return Err("DHCPNAK received".into());
-                        }
-                        ParseAckResult::None => {}
-                    },
-                    None => break, // Timeout, trigger retry loop
+            if let Some(ack_res) = self.wait_for_ack(xid, timeout).await? {
+                match ack_res {
+                    ParseAckResult::Ack(ack) => {
+                        println!("[dhcp-client] Received DHCPACK for IP: {}", ack.ip);
+                        return Ok(ack);
+                    }
+                    ParseAckResult::Nak => {
+                        println!("[dhcp-client] Received DHCPNAK!");
+                        return Err("DHCPNAK received".into());
+                    }
+                    ParseAckResult::None => {}
                 }
             }
 
@@ -245,7 +219,6 @@ impl DhcpClient {
     ) -> Result<DhcpAck, Box<dyn std::error::Error + Send + Sync>> {
         let renew_xid = rand::random::<u32>();
         let mut renew_sent: Option<std::time::Instant> = None;
-        let mut buf = [0u8; 2048];
 
         loop {
             let current_elapsed = bound_at.elapsed().as_secs() as u32;
@@ -279,10 +252,9 @@ impl DhcpClient {
                 renew_sent = Some(std::time::Instant::now());
             }
 
-            // Listen for ACK during this interval
             let listen_timeout = std::time::Duration::from_secs(retry_interval as u64);
-            match self.receive_packet(&mut buf, listen_timeout).await? {
-                Some(n) => match parse_ack_nak(&buf[..n], renew_xid) {
+            if let Some(ack_res) = self.wait_for_ack(renew_xid, listen_timeout).await? {
+                match ack_res {
                     ParseAckResult::Ack(new_ack) => {
                         println!("[dhcp-client] Renewal successful!");
                         return Ok(new_ack);
@@ -292,10 +264,60 @@ impl DhcpClient {
                         return Err("Lease renewal NAK'd".into());
                     }
                     ParseAckResult::None => {}
-                },
-                None => {} // Timeout, retry
+                }
             }
         }
+    }
+
+    async fn wait_for_offer(
+        &self,
+        xid: u32,
+        timeout: std::time::Duration,
+    ) -> Result<Option<DhcpOffer>, Box<dyn std::error::Error + Send + Sync>> {
+        let start = std::time::Instant::now();
+        let mut buf = [0u8; 2048];
+
+        while start.elapsed() < timeout {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+
+            let Some(n) = self.receive_packet(&mut buf, remaining).await? else {
+                break; // Timeout
+            };
+
+            if let Some(offer) = parse_offer(&buf[..n], xid) {
+                return Ok(Some(offer));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn wait_for_ack(
+        &self,
+        xid: u32,
+        timeout: std::time::Duration,
+    ) -> Result<Option<ParseAckResult>, Box<dyn std::error::Error + Send + Sync>> {
+        let start = std::time::Instant::now();
+        let mut buf = [0u8; 2048];
+
+        while start.elapsed() < timeout {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+
+            let Some(n) = self.receive_packet(&mut buf, remaining).await? else {
+                break; // Timeout
+            };
+
+            let res = parse_ack_nak(&buf[..n], xid);
+            if !matches!(res, ParseAckResult::None) {
+                return Ok(Some(res));
+            }
+        }
+        Ok(None)
     }
 
     async fn receive_packet(
