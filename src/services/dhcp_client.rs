@@ -9,6 +9,7 @@ use tokio::net::UdpSocket;
 const DEFAULT_LEASE_SECS: u32 = 3600;
 const MAX_RETRY_DELAY_SECS: u32 = 64;
 const INITIAL_RETRY_DELAY_SECS: u32 = 4;
+const DEFAULT_SUBNET_MASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
 
 struct DhcpOffer {
     offered_ip: Ipv4Addr,
@@ -677,7 +678,7 @@ async fn configure_wan(
     // Add default route
     if let Some(gw) = gateway {
         let route = rtnetlink::RouteMessageBuilder::<Ipv4Addr>::new()
-            .destination_prefix(Ipv4Addr::new(0, 0, 0, 0), 0)
+            .destination_prefix(Ipv4Addr::UNSPECIFIED, 0)
             .gateway(gw)
             .output_interface(index)
             .build();
@@ -704,7 +705,7 @@ fn parse_lease_options(
 
     let mask = match dhcp.opts().get(OptionCode::SubnetMask) {
         Some(DhcpOption::SubnetMask(m)) => *m,
-        _ => Ipv4Addr::new(255, 255, 255, 0),
+        _ => DEFAULT_SUBNET_MASK,
     };
 
     let gateway = match dhcp.opts().get(OptionCode::Router) {
@@ -747,4 +748,123 @@ fn make_client_socket(interface_name: &str) -> std::io::Result<UdpSocket> {
     std_socket.set_nonblocking(true)?;
     let socket = UdpSocket::from_std(std_socket)?;
     Ok(socket)
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dhcproto::v4::{DhcpOption, Message, MessageType};
+    use dhcproto::{Encodable, Encoder};
+
+    const MOCK_SERVER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
+    const MOCK_CLIENT_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
+    const DEFAULT_MASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
+    const DNS_IP_1: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
+    const DNS_IP_2: Ipv4Addr = Ipv4Addr::new(8, 8, 4, 4);
+
+    fn encode_msg(msg: &Message) -> Vec<u8> {
+        let mut buf = Vec::new();
+        msg.encode(&mut Encoder::new(&mut buf)).unwrap();
+        buf
+    }
+
+    #[test]
+    fn test_parse_offer_valid() {
+        let mut msg = Message::default();
+        msg.set_xid(0x12345678);
+        msg.opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Offer));
+        msg.opts_mut()
+            .insert(DhcpOption::ServerIdentifier(MOCK_SERVER_IP));
+        msg.set_yiaddr(MOCK_CLIENT_IP);
+
+        let buf = encode_msg(&msg);
+        let res = parse_offer(&buf, 0x12345678).unwrap();
+        assert_eq!(res.offered_ip, MOCK_CLIENT_IP);
+        assert_eq!(res.server_ip, Some(MOCK_SERVER_IP));
+    }
+
+    #[test]
+    fn test_parse_offer_mismatched_xid() {
+        let mut msg = Message::default();
+        msg.set_xid(0x11111111);
+        msg.opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Offer));
+
+        let buf = encode_msg(&msg);
+        let res = parse_offer(&buf, 0x22222222);
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_parse_offer_missing_server_id() {
+        let mut msg = Message::default();
+        msg.set_xid(0x12345678);
+        msg.opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Offer));
+        msg.set_yiaddr(MOCK_CLIENT_IP);
+
+        let buf = encode_msg(&msg);
+        let res = parse_offer(&buf, 0x12345678).unwrap();
+        assert_eq!(res.offered_ip, MOCK_CLIENT_IP);
+        assert_eq!(res.server_ip, None);
+    }
+
+    #[test]
+    fn test_parse_ack_valid() {
+        let mut msg = Message::default();
+        msg.set_xid(0xabcdef);
+        msg.opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Ack));
+        msg.opts_mut().insert(DhcpOption::SubnetMask(DEFAULT_MASK));
+        msg.opts_mut()
+            .insert(DhcpOption::Router(vec![MOCK_SERVER_IP]));
+        msg.opts_mut()
+            .insert(DhcpOption::DomainNameServer(vec![DNS_IP_1, DNS_IP_2]));
+        msg.opts_mut().insert(DhcpOption::AddressLeaseTime(1800));
+        msg.opts_mut()
+            .insert(DhcpOption::ServerIdentifier(MOCK_SERVER_IP));
+        msg.set_yiaddr(MOCK_CLIENT_IP);
+
+        let buf = encode_msg(&msg);
+        let res = parse_ack_nak(&buf, 0xabcdef);
+        if let ParseAckResult::Ack(ack) = res {
+            assert_eq!(ack.ip, MOCK_CLIENT_IP);
+            assert_eq!(ack.mask, DEFAULT_MASK);
+            assert_eq!(ack.gateway, Some(MOCK_SERVER_IP));
+            assert_eq!(ack.dns_servers, vec![DNS_IP_1, DNS_IP_2]);
+            assert_eq!(ack.lease_secs, 1800);
+            assert_eq!(ack.server_ip, Some(MOCK_SERVER_IP));
+        } else {
+            panic!("Expected Ack");
+        }
+    }
+
+    #[test]
+    fn test_parse_nak() {
+        let mut msg = Message::default();
+        msg.set_xid(0x9999);
+        msg.opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Nak));
+
+        let buf = encode_msg(&msg);
+        let res = parse_ack_nak(&buf, 0x9999);
+        assert!(matches!(res, ParseAckResult::Nak));
+    }
+
+    #[test]
+    fn test_parse_lease_options_missing_fields() {
+        let mut msg = Message::default();
+        msg.opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Ack));
+
+        let (mask, gateway, dns, lease_secs) = parse_lease_options(&msg);
+        assert_eq!(mask, DEFAULT_MASK);
+        assert_eq!(gateway, None);
+        assert!(dns.is_empty());
+        assert_eq!(lease_secs, DEFAULT_LEASE_SECS);
+    }
 }

@@ -124,6 +124,9 @@ async fn test_all_router_features() {
     println!("\n=== STAGE 3: DNS Forwarding Verification ===");
     test_3_dns_forwarding(&mut env).await;
 
+    println!("\n=== STAGE 4: DHCP Renewal Verification ===");
+    test_4_dhcp_renewal(&mut env).await;
+
     // 3. Tear down VM cleanly
     println!("\n=== Cleaning up QEMU VM... ===");
     drop(env._qemu_guard);
@@ -493,6 +496,28 @@ async fn test_3_dns_forwarding(env: &mut TestEnv) {
     println!("[test] DNS UDP forwarding verified successfully.");
 }
 
+async fn test_4_dhcp_renewal(env: &mut TestEnv) {
+    println!("[test] Waiting for DHCP lease renewal from WAN client...");
+    let mut renewal_verified = false;
+    let start_wan = std::time::Instant::now();
+    while start_wan.elapsed() < Duration::from_secs(35) {
+        tokio::select! {
+            Some(msg) = env.wan_verification_rx.recv() => {
+                if msg == "DHCP_RENEWAL_VERIFIED" {
+                    renewal_verified = true;
+                    break;
+                }
+            }
+            _ = sleep(Duration::from_millis(50)) => {}
+        }
+    }
+    assert!(
+        renewal_verified,
+        "WAN mock server did not verify DHCP lease renewal"
+    );
+    println!("[test] DHCP lease renewal verified successfully.");
+}
+
 async fn run_mock_wan_isp(
     mut mock: UnixStreamMock,
     verification_tx: tokio::sync::mpsc::Sender<String>,
@@ -612,7 +637,7 @@ async fn run_mock_wan_isp(
     // 5. WAN Loop to handle ARP, ICMP transit, and DNS queries
     println!("[isp-test] Entering WAN verification event loop...");
     let start = std::time::Instant::now();
-    let timeout_dur = Duration::from_secs(30);
+    let timeout_dur = Duration::from_secs(60);
 
     loop {
         if start.elapsed() >= timeout_dur {
@@ -683,15 +708,61 @@ async fn run_mock_wan_isp(
                     DNS_RESPONSE,
                 );
                 let _ = mock.send_frame(&dns_reply).await;
+                continue;
             }
-            continue;
+        }
+
+        // D. Handle DHCPREQUEST (renewal)
+        if let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(&frame)
+            && eth.get_ethertype() == pnet::packet::ethernet::EtherTypes::Ipv4
+        {
+            let ip = pnet::packet::ipv4::Ipv4Packet::new(eth.payload()).unwrap();
+            println!(
+                "[isp-test] Debug IPv4 frame: proto={:?}, len={}",
+                ip.get_next_level_protocol(),
+                ip.payload().len()
+            );
+            if ip.get_next_level_protocol() == pnet::packet::ip::IpNextHeaderProtocols::Udp {
+                let udp = pnet::packet::udp::UdpPacket::new(ip.payload()).unwrap();
+                println!(
+                    "[isp-test] Debug UDP packet: src_port={}, dest_port={}",
+                    udp.get_source(),
+                    udp.get_destination()
+                );
+                if udp.get_destination() == 67
+                    && let Ok(dhcp_req) =
+                        dhcproto::v4::Message::decode(&mut dhcproto::Decoder::new(udp.payload()))
+                    && let Some(dhcproto::v4::DhcpOption::MessageType(
+                        dhcproto::v4::MessageType::Request,
+                    )) = dhcp_req.opts().get(dhcproto::v4::OptionCode::MessageType)
+                {
+                    println!("[isp-test] Verified DHCP renewal request from WAN client!");
+                    let renew_ack = build_dhcp_ack(dhcp_req.xid(), client_mac);
+                    let ack_frame = packet::build_raw_packet(
+                        MOCK_SERVER_MAC,
+                        client_mac,
+                        MOCK_SERVER_IP,
+                        Ipv4Addr::BROADCAST,
+                        67,
+                        68,
+                        &renew_ack,
+                    );
+                    let _ = mock.send_frame(&ack_frame).await;
+                    let _ = verification_tx
+                        .send("DHCP_RENEWAL_VERIFIED".to_string())
+                        .await;
+                    continue;
+                }
+            }
         }
     }
 
     true
 }
 
-fn parse_dhcp_message(frame: &[u8]) -> Result<dhcproto::v4::Message, Box<dyn std::error::Error>> {
+fn parse_dhcp_message(
+    frame: &[u8],
+) -> Result<dhcproto::v4::Message, Box<dyn std::error::Error + Send + Sync>> {
     if frame.len() < 42 {
         return Err("Packet too short".into());
     }
@@ -769,7 +840,7 @@ fn build_dhcp_ack(xid: u32, client_mac: MacAddr) -> Vec<u8> {
         MOCK_DNS_SERVER,
     ]));
     opts.insert(DhcpOption::ServerIdentifier(MOCK_SERVER_IP));
-    opts.insert(DhcpOption::AddressLeaseTime(3600));
+    opts.insert(DhcpOption::AddressLeaseTime(60));
 
     let mut payload = Vec::new();
     ack.encode(&mut Encoder::new(&mut payload)).unwrap();
