@@ -3,6 +3,10 @@ name = "rustyrouter"
 version = "0.1.0"
 edition = "2024"
 
+[[test]]
+name = "wan_dhcp_test"
+harness = false
+
 [dependencies]
 tokio = { version = "1.53.0", features = ["full"] }
 nix = { version = "0.31.3", features = ["mount", "signal", "process", "reboot", "kmod"] }

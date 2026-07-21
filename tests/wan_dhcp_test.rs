@@ -109,25 +109,69 @@ struct TestEnv {
     router_lan_mac: MacAddr,
 }
 
-#[tokio::test]
-async fn test_all_router_features() {
-    // 1. Run the unified startup stage (socket bind, QEMU boot, DHCP, ARP)
+macro_rules! run_step {
+    ($name:expr, $future:expr, $passed:ident, $failed:ident) => {
+        print!("test {} ... ", $name);
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        let start = std::time::Instant::now();
+        let result = std::panic::AssertUnwindSafe($future).catch_unwind().await;
+        match result {
+            Ok(_) => {
+                println!("ok (in {:.2?})", start.elapsed());
+                $passed += 1;
+            }
+            Err(payload) => {
+                println!("FAILED");
+                $failed += 1;
+                if let Some(s) = payload.downcast_ref::<&str>() {
+                    println!("\nstep {} panicked: {}\n", $name, s);
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    println!("\nstep {} panicked: {}\n", $name, s);
+                } else {
+                    println!("\nstep {} panicked with unknown error\n", $name);
+                }
+                break;
+            }
+        }
+    };
+}
+
+#[tokio::main]
+async fn main() {
+    use futures_util::FutureExt;
+
+    println!("\nrunning 4 test steps");
     let mut env = startup_stage().await;
 
-    // 2. Run the logical test stages sequentially
-    println!("\n=== STAGE 1: DHCP and ARP Verification ===");
-    test_1_wan_and_lan_dhcp(&env).await;
+    let mut passed = 0;
+    let mut failed = 0;
 
-    println!("\n=== STAGE 2: NAT Routing (Masquerading) Verification ===");
-    test_2_nat_routing(&mut env).await;
+    let start_time = std::time::Instant::now();
 
-    println!("\n=== STAGE 3: DNS Forwarding Verification ===");
-    test_3_dns_forwarding(&mut env).await;
+    loop {
+        run_step!(
+            "wan_and_lan_dhcp",
+            verify_wan_and_lan_dhcp(&env),
+            passed,
+            failed
+        );
+        run_step!("nat_routing", verify_nat_routing(&mut env), passed, failed);
+        run_step!(
+            "dns_forwarding",
+            verify_dns_forwarding(&mut env),
+            passed,
+            failed
+        );
+        run_step!(
+            "dhcp_renewal",
+            verify_dhcp_renewal(&mut env),
+            passed,
+            failed
+        );
+        break;
+    }
 
-    println!("\n=== STAGE 4: DHCP Renewal Verification ===");
-    test_4_dhcp_renewal(&mut env).await;
-
-    // 3. Tear down VM cleanly
+    // Tear down VM cleanly
     println!("\n=== Cleaning up QEMU VM... ===");
     drop(env._qemu_guard);
     let _ = env._qemu_child.kill().await;
@@ -137,7 +181,20 @@ async fn test_all_router_features() {
     let _ = std::fs::remove_file("/workspaces/rustyrouter/target/wan.sock");
     let _ = std::fs::remove_file("/workspaces/rustyrouter/target/lan.sock");
 
-    println!("\n=== All integration test stages completed successfully! ===");
+    let elapsed = start_time.elapsed();
+    if failed > 0 {
+        println!(
+            "\ntest result: FAILED. {} passed; {} failed; finished in {:.2?}\n",
+            passed, failed, elapsed
+        );
+        std::process::exit(101);
+    } else {
+        println!(
+            "\ntest result: ok. {} passed; {} failed; finished in {:.2?}\n",
+            passed, failed, elapsed
+        );
+        std::process::exit(0);
+    }
 }
 
 async fn startup_stage() -> TestEnv {
@@ -367,7 +424,7 @@ async fn startup_stage() -> TestEnv {
     }
 }
 
-async fn test_1_wan_and_lan_dhcp(env: &TestEnv) {
+async fn verify_wan_and_lan_dhcp(env: &TestEnv) {
     assert!(env.leased_ip.is_some(), "LAN client IP was not leased");
     assert_ne!(
         env.router_lan_mac,
@@ -377,7 +434,7 @@ async fn test_1_wan_and_lan_dhcp(env: &TestEnv) {
     println!("[test] DHCP and ARP startup verified successfully.");
 }
 
-async fn test_2_nat_routing(env: &mut TestEnv) {
+async fn verify_nat_routing(env: &mut TestEnv) {
     let leased_ip = env.leased_ip.unwrap();
 
     // Send ICMP Ping to 8.8.8.8 and expect ICMP Reply back
@@ -434,7 +491,7 @@ async fn test_2_nat_routing(env: &mut TestEnv) {
     println!("[test] NAT Masquerading routing verified successfully.");
 }
 
-async fn test_3_dns_forwarding(env: &mut TestEnv) {
+async fn verify_dns_forwarding(env: &mut TestEnv) {
     let leased_ip = env.leased_ip.unwrap();
 
     // Send DNS Query for google.com to 192.168.1.1:53 and expect DNS Response back
@@ -496,7 +553,7 @@ async fn test_3_dns_forwarding(env: &mut TestEnv) {
     println!("[test] DNS UDP forwarding verified successfully.");
 }
 
-async fn test_4_dhcp_renewal(env: &mut TestEnv) {
+async fn verify_dhcp_renewal(env: &mut TestEnv) {
     println!("[test] Waiting for DHCP lease renewal from WAN client...");
     let mut renewal_verified = false;
     let start_wan = std::time::Instant::now();
