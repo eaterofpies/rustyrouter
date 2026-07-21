@@ -513,7 +513,11 @@ async fn run_mock_wan_isp(
         let frame = match tokio::time::timeout(Duration::from_millis(100), mock.recv_frame()).await
         {
             Ok(Ok(frame)) => frame,
-            _ => continue,
+            Ok(Err(_)) => {
+                println!("[isp-test] Connection closed while waiting for DHCPDISCOVER");
+                return false;
+            }
+            Err(_) => continue, // Timeout
         };
 
         if let Ok(dhcp_discover) = parse_dhcp_message(&frame) {
@@ -566,7 +570,11 @@ async fn run_mock_wan_isp(
         let frame = match tokio::time::timeout(Duration::from_millis(100), mock.recv_frame()).await
         {
             Ok(Ok(frame)) => frame,
-            _ => continue,
+            Ok(Err(_)) => {
+                println!("[isp-test] Connection closed while waiting for DHCPREQUEST");
+                return false;
+            }
+            Err(_) => continue, // Timeout
         };
         if let Ok(dhcp_request) = parse_dhcp_message(&frame) {
             use dhcproto::v4::MessageType;
@@ -613,7 +621,11 @@ async fn run_mock_wan_isp(
         let frame = match tokio::time::timeout(Duration::from_millis(100), mock.recv_frame()).await
         {
             Ok(Ok(frame)) => frame,
-            _ => continue,
+            Ok(Err(_)) => {
+                println!("[isp-test] WAN socket connection closed. Exiting verification event loop.");
+                break;
+            }
+            Err(_) => continue, // Timeout
         };
 
         if let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(&frame) {
