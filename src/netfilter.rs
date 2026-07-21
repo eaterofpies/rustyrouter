@@ -1,5 +1,10 @@
-use rustables::{Batch, Chain, MsgType, ProtocolFamily, Table, Hook, HookClass, Rule, ChainPolicy, ChainType};
-use rustables::expr::{Meta, MetaType, Cmp, CmpOp, Masquerade, Immediate, VerdictKind, Conntrack, ConntrackKey, ConnTrackState, Bitwise};
+use rustables::expr::{
+    Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Immediate, Masquerade, Meta,
+    MetaType, VerdictKind,
+};
+use rustables::{
+    Batch, Chain, ChainPolicy, ChainType, Hook, HookClass, MsgType, ProtocolFamily, Rule, Table,
+};
 
 fn pad_interface_name(name: &str) -> [u8; 16] {
     let mut bytes = [0u8; 16];
@@ -61,6 +66,26 @@ pub fn configure_firewall(
     lan_rule.add_expr(Cmp::new(CmpOp::Eq, pad_interface_name(lan_iface)));
     lan_rule.add_expr(Immediate::new_verdict(VerdictKind::Accept));
 
+    // 6.2. Rule: Accept DHCP client traffic on WAN interface (UDP destination port 68)
+    let mut wan_dhcp_rule = Rule::new(&filter_chain)?;
+    wan_dhcp_rule.add_expr(Meta::new(MetaType::IifName));
+    wan_dhcp_rule.add_expr(Cmp::new(CmpOp::Eq, pad_interface_name(wan_iface)));
+    wan_dhcp_rule.add_expr(
+        rustables::expr::HighLevelPayload::Network(rustables::expr::NetworkHeaderField::IPv4(
+            rustables::expr::IPv4HeaderField::Protocol,
+        ))
+        .build(),
+    );
+    wan_dhcp_rule.add_expr(Cmp::new(CmpOp::Eq, (libc::IPPROTO_UDP as u8).to_be_bytes()));
+    wan_dhcp_rule.add_expr(
+        rustables::expr::HighLevelPayload::Transport(rustables::expr::TransportHeaderField::Udp(
+            rustables::expr::UDPHeaderField::Dport,
+        ))
+        .build(),
+    );
+    wan_dhcp_rule.add_expr(Cmp::new(CmpOp::Eq, (dhcproto::v4::CLIENT_PORT as u16).to_be_bytes()));
+    wan_dhcp_rule.add_expr(Immediate::new_verdict(VerdictKind::Accept));
+
     // 6.5. Rule: Accept ICMP on all interfaces (allows external/internal pings)
     let icmp_rule = Rule::new(&filter_chain)?.icmp().accept();
 
@@ -72,6 +97,7 @@ pub fn configure_firewall(
     batch.add(&masq_rule, MsgType::Add);
     batch.add(&lo_rule, MsgType::Add);
     batch.add(&lan_rule, MsgType::Add);
+    batch.add(&wan_dhcp_rule, MsgType::Add);
     batch.add(&icmp_rule, MsgType::Add);
     batch.add(&ct_rule, MsgType::Add);
 

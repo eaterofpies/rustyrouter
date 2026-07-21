@@ -197,7 +197,7 @@ async fn startup_stage() -> TestEnv {
     // E. Launch QEMU pointing to UNIX domain sockets
     println!("[test-env] Launching QEMU VM...");
     let mut qemu_child = Command::new("qemu-system-x86_64")
-        .args(&[
+        .args([
             "-kernel", &kernel,
             "-initrd", "target/initramfs.cpio.gz",
             "-append", "console=ttyS0 quiet panic=-1 net.ifnames=0 rustyrouter.wan=eth0 rustyrouter.lan=eth1 rustyrouter.lan_ip=192.168.1.1/24",
