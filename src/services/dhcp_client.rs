@@ -210,74 +210,90 @@ impl DhcpClient {
             // T2 Rebinding time is 87.5% of lease (RFC 2131 section 4.4.5)
             let t2_secs = (lease_secs as f64 * 0.875) as u32;
 
-            // Enter renewal loop
-            let renew_xid = rand::random::<u32>();
-            let mut renew_sent: Option<std::time::Instant> = None;
-            let mut buf = [0u8; 2048];
+            // Perform lease renewal phase
+            match self
+                .renew_lease(ip, t2_secs, lease_secs, server_ip, bound_at)
+                .await
+            {
+                Ok(new_ack) => {
+                    ip = new_ack.ip;
+                    mask = new_ack.mask;
+                    gateway = new_ack.gateway;
+                    dns_servers = new_ack.dns_servers;
+                    lease_secs = new_ack.lease_secs;
+                    server_ip = new_ack.server_ip;
 
-            loop {
-                let current_elapsed = bound_at.elapsed().as_secs() as u32;
-                if current_elapsed >= lease_secs {
-                    println!("[dhcp-client] Lease expired during renewal!");
+                    self.apply_lease_config(ip, mask, gateway, &dns_servers)
+                        .await?;
+                    bound_at = std::time::Instant::now();
+                }
+                Err(e) => {
                     self.deconfigure().await;
-                    return Err("Lease expired during renewal".into());
+                    return Err(e);
                 }
+            }
+        }
+    }
 
-                let in_rebinding = current_elapsed >= t2_secs;
-                let (retry_interval, dest_ip) = if in_rebinding {
-                    let remaining = lease_secs.saturating_sub(current_elapsed);
-                    let interval = std::cmp::max(remaining / 2, 60);
-                    (interval, Ipv4Addr::BROADCAST)
+    async fn renew_lease(
+        &self,
+        ip: Ipv4Addr,
+        t2_secs: u32,
+        lease_secs: u32,
+        server_ip: Option<Ipv4Addr>,
+        bound_at: std::time::Instant,
+    ) -> Result<DhcpAck, Box<dyn std::error::Error + Send + Sync>> {
+        let renew_xid = rand::random::<u32>();
+        let mut renew_sent: Option<std::time::Instant> = None;
+        let mut buf = [0u8; 2048];
+
+        loop {
+            let current_elapsed = bound_at.elapsed().as_secs() as u32;
+            if current_elapsed >= lease_secs {
+                return Err("Lease expired during renewal".into());
+            }
+
+            let in_rebinding = current_elapsed >= t2_secs;
+            let (retry_interval, dest_ip) = if in_rebinding {
+                let remaining = lease_secs.saturating_sub(current_elapsed);
+                let interval = std::cmp::max(remaining / 2, 60);
+                (interval, Ipv4Addr::BROADCAST)
+            } else {
+                let remaining = t2_secs.saturating_sub(current_elapsed);
+                let interval = std::cmp::max(remaining / 2, 60);
+                (interval, server_ip.unwrap_or(Ipv4Addr::BROADCAST))
+            };
+
+            let should_send = match renew_sent {
+                None => true,
+                Some(t) => t.elapsed().as_secs() as u32 >= retry_interval,
+            };
+
+            if should_send {
+                if in_rebinding {
+                    println!("[dhcp-client] REBINDING: sending broadcast DHCPREQUEST...");
                 } else {
-                    let remaining = t2_secs.saturating_sub(current_elapsed);
-                    let interval = std::cmp::max(remaining / 2, 60);
-                    (interval, server_ip.unwrap_or(Ipv4Addr::BROADCAST))
-                };
-
-                let should_send = match renew_sent {
-                    None => true,
-                    Some(t) => t.elapsed().as_secs() as u32 >= retry_interval,
-                };
-
-                if should_send {
-                    if in_rebinding {
-                        println!("[dhcp-client] REBINDING: sending broadcast DHCPREQUEST...");
-                        self.send_request(renew_xid, ip, None, ip, dest_ip).await;
-                    } else {
-                        println!(
-                            "[dhcp-client] RENEWING: sending unicast DHCPREQUEST to server..."
-                        );
-                        self.send_request(renew_xid, ip, None, ip, dest_ip).await;
-                    }
-                    renew_sent = Some(std::time::Instant::now());
+                    println!("[dhcp-client] RENEWING: sending unicast DHCPREQUEST to server...");
                 }
+                self.send_request(renew_xid, ip, None, ip, dest_ip).await;
+                renew_sent = Some(std::time::Instant::now());
+            }
 
-                // Listen for ACK during this interval
-                let listen_timeout = std::time::Duration::from_secs(retry_interval as u64);
-                if let Some(n) = self.receive_packet(&mut buf, listen_timeout).await? {
-                    match parse_ack_nak(&buf[..n], renew_xid) {
-                        ParseAckResult::Ack(new_ack) => {
-                            println!("[dhcp-client] Renewal successful!");
-                            ip = new_ack.ip;
-                            mask = new_ack.mask;
-                            gateway = new_ack.gateway;
-                            dns_servers = new_ack.dns_servers;
-                            lease_secs = new_ack.lease_secs;
-                            server_ip = new_ack.server_ip;
-
-                            self.apply_lease_config(ip, mask, gateway, &dns_servers)
-                                .await?;
-                            bound_at = std::time::Instant::now();
-                            break; // Escape renewal retry loop, restart bound loop with updated parameters
-                        }
-                        ParseAckResult::Nak => {
-                            println!("[dhcp-client] Renewal NAK'd!");
-                            self.deconfigure().await;
-                            return Err("Lease renewal NAK'd".into());
-                        }
-                        ParseAckResult::None => {}
+            // Listen for ACK during this interval
+            let listen_timeout = std::time::Duration::from_secs(retry_interval as u64);
+            match self.receive_packet(&mut buf, listen_timeout).await? {
+                Some(n) => match parse_ack_nak(&buf[..n], renew_xid) {
+                    ParseAckResult::Ack(new_ack) => {
+                        println!("[dhcp-client] Renewal successful!");
+                        return Ok(new_ack);
                     }
-                }
+                    ParseAckResult::Nak => {
+                        println!("[dhcp-client] Renewal NAK'd!");
+                        return Err("Lease renewal NAK'd".into());
+                    }
+                    ParseAckResult::None => {}
+                },
+                None => {} // Timeout, retry
             }
         }
     }
@@ -351,14 +367,15 @@ impl DhcpClient {
             (ip, mask)
         };
 
-        if let Some(ip) = ip
-            && let Some(mask) = mask
-            && let Err(e) = deconfigure_wan(&self.wan_interface, ip, mask).await
-        {
-            println!(
-                "[dhcp-client] ERROR: Failed to deconfigure WAN interface via netlink: {}",
-                e
-            );
+        if let Some(ip) = ip {
+            if let Some(mask) = mask {
+                if let Err(e) = deconfigure_wan(&self.wan_interface, ip, mask).await {
+                    println!(
+                        "[dhcp-client] ERROR: Failed to deconfigure WAN interface via netlink: {}",
+                        e
+                    );
+                }
+            }
         }
     }
 
@@ -580,8 +597,10 @@ async fn deconfigure_wan(
                     break;
                 }
             }
-            if matches_ip && let Err(e) = handle.address().del(addr).execute().await {
-                println!("[dhcp-client] WARNING: Failed to delete IP address: {}", e);
+            if matches_ip {
+                if let Err(e) = handle.address().del(addr).execute().await {
+                    println!("[dhcp-client] WARNING: Failed to delete IP address: {}", e);
+                }
             }
         }
     }
