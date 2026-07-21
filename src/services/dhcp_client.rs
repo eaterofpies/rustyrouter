@@ -1,10 +1,13 @@
+use super::utils::{
+    SharedWanLease, WanLease, get_interface_mac, open_raw_socket, parse_dhcp_payload,
+    read_raw_packet, send_raw_packet,
+};
 use crate::packet::build_raw_packet;
+use futures_util::TryStreamExt;
 use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;
 use tokio::io::unix::AsyncFd;
-use super::utils::{get_interface_mac, open_raw_socket, parse_dhcp_payload, SharedWanLease, WanLease, read_raw_packet, send_raw_packet};
-use futures_util::TryStreamExt;
 
 #[derive(Debug, Clone, PartialEq)]
 enum ClientState {
@@ -37,26 +40,35 @@ enum ClientState {
 // =========================================================================
 // DHCP Client (WAN)
 // =========================================================================
-pub async fn start_dhcp_client(
-    wan_interface: String,
-    lease_state: SharedWanLease,
-) {
-    println!("[dhcp-client] Starting WAN DHCP client on {}...", wan_interface);
+pub async fn start_dhcp_client(wan_interface: String, lease_state: SharedWanLease) {
+    println!(
+        "[dhcp-client] Starting WAN DHCP client on {}...",
+        wan_interface
+    );
 
     let mac = match get_interface_mac(&wan_interface).await {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("[dhcp-client] ERROR: Failed to get MAC address for {}: {}", wan_interface, e);
+            eprintln!(
+                "[dhcp-client] ERROR: Failed to get MAC address for {}: {}",
+                wan_interface, e
+            );
             return;
         }
     };
-    println!("[dhcp-client] Interface {} MAC address: {}", wan_interface, mac);
+    println!(
+        "[dhcp-client] Interface {} MAC address: {}",
+        wan_interface, mac
+    );
 
     loop {
         let raw_fd = match open_raw_socket(&wan_interface) {
             Ok(fd) => fd,
             Err(e) => {
-                eprintln!("[dhcp-client] ERROR: Failed to open raw socket: {}. Retrying in 5s...", e);
+                eprintln!(
+                    "[dhcp-client] ERROR: Failed to open raw socket: {}. Retrying in 5s...",
+                    e
+                );
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
@@ -65,15 +77,22 @@ pub async fn start_dhcp_client(
         let async_sock = match AsyncFd::new(raw_fd) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[dhcp-client] ERROR: Failed to wrap raw socket: {}. Retrying in 5s...", e);
-                unsafe { libc::close(raw_fd); }
+                eprintln!(
+                    "[dhcp-client] ERROR: Failed to wrap raw socket: {}. Retrying in 5s...",
+                    e
+                );
+                unsafe {
+                    libc::close(raw_fd);
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
         };
 
         run_client_loop(&async_sock, mac, &lease_state, &wan_interface).await;
-        unsafe { libc::close(raw_fd); }
+        unsafe {
+            libc::close(raw_fd);
+        }
         println!("[dhcp-client] Socket closed. Restarting client loop in 5s...");
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
@@ -81,11 +100,7 @@ pub async fn start_dhcp_client(
 
 fn calculate_next_delay(current_delay: u32) -> u32 {
     let doubled = current_delay * 2;
-    if doubled > 64 {
-        64
-    } else {
-        doubled
-    }
+    if doubled > 64 { 64 } else { doubled }
 }
 
 fn get_jittered_duration(base_secs: u32) -> std::time::Duration {
@@ -116,13 +131,14 @@ async fn run_client_loop(
 
         let read_res = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            read_raw_packet(async_sock, &mut buf)
-        ).await;
+            read_raw_packet(async_sock, &mut buf),
+        )
+        .await;
 
         let bytes_read = match read_res {
             Ok(Ok(n)) => n,
             Ok(Err(_)) => break, // Socket error, recreate socket
-            Err(_) => continue, // Timeout, tick again
+            Err(_) => continue,  // Timeout, tick again
         };
 
         handle_incoming_packet(bytes_read, &buf, &mut state, lease_state, wan_interface).await;
@@ -137,7 +153,11 @@ async fn handle_state_tick(
     wan_interface: &str,
 ) {
     match state {
-        ClientState::Discovering { xid, last_sent, retry_delay_secs } => {
+        ClientState::Discovering {
+            xid,
+            last_sent,
+            retry_delay_secs,
+        } => {
             let threshold = get_jittered_duration(*retry_delay_secs);
             if last_sent.elapsed() >= threshold {
                 send_discover(async_sock, mac, *xid).await;
@@ -145,7 +165,14 @@ async fn handle_state_tick(
                 *retry_delay_secs = calculate_next_delay(*retry_delay_secs);
             }
         }
-        ClientState::Requesting { xid, offered_ip, server_ip, server_mac: _, last_sent, retry_delay_secs } => {
+        ClientState::Requesting {
+            xid,
+            offered_ip,
+            server_ip,
+            server_mac: _,
+            last_sent,
+            retry_delay_secs,
+        } => {
             let threshold = get_jittered_duration(*retry_delay_secs);
             if last_sent.elapsed() >= threshold {
                 send_request(
@@ -157,7 +184,8 @@ async fn handle_state_tick(
                     *server_ip,
                     Ipv4Addr::UNSPECIFIED,
                     Ipv4Addr::BROADCAST,
-                ).await;
+                )
+                .await;
                 *last_sent = std::time::Instant::now();
                 *retry_delay_secs = calculate_next_delay(*retry_delay_secs);
             }
@@ -177,7 +205,10 @@ async fn handle_state_tick(
             if elapsed >= *lease_secs {
                 println!("[dhcp-client] Lease expired!");
                 if let Err(e) = deconfigure_wan(wan_interface, *ip, *mask).await {
-                    println!("[dhcp-client] ERROR: Failed to deconfigure WAN interface via netlink: {}", e);
+                    println!(
+                        "[dhcp-client] ERROR: Failed to deconfigure WAN interface via netlink: {}",
+                        e
+                    );
                 }
                 let mut lease = lease_state.lock().unwrap();
                 *lease = WanLease::default();
@@ -204,7 +235,8 @@ async fn handle_state_tick(
                     rebinding_threshold_secs,
                     *renew_xid,
                     renew_sent,
-                ).await;
+                )
+                .await;
             }
         }
     }
@@ -224,13 +256,26 @@ async fn handle_renewal_tick(
 ) {
     let in_rebinding = elapsed >= rebinding_threshold_secs;
     let (retry_interval, dest_mac, dest_ip) = if in_rebinding {
-        let remaining_to_expiry = if lease_secs > elapsed { lease_secs - elapsed } else { 0 };
-        let interval = if remaining_to_expiry > 60 { remaining_to_expiry / 2 } else { 60 };
+        let remaining_to_expiry = lease_secs.saturating_sub(elapsed);
+
+        let interval = if remaining_to_expiry > 60 {
+            remaining_to_expiry / 2
+        } else {
+            60
+        };
         (interval, MacAddr::broadcast(), Ipv4Addr::BROADCAST)
     } else {
         let remaining_to_rebinding = rebinding_threshold_secs - elapsed;
-        let interval = if remaining_to_rebinding > 60 { remaining_to_rebinding / 2 } else { 60 };
-        (interval, server_mac, server_ip.unwrap_or(Ipv4Addr::BROADCAST))
+        let interval = if remaining_to_rebinding > 60 {
+            remaining_to_rebinding / 2
+        } else {
+            60
+        };
+        (
+            interval,
+            server_mac,
+            server_ip.unwrap_or(Ipv4Addr::BROADCAST),
+        )
     };
 
     let should_send = match renew_sent {
@@ -244,16 +289,7 @@ async fn handle_renewal_tick(
         } else {
             println!("[dhcp-client] RENEWING: sending unicast DHCPREQUEST to server...");
         }
-        send_request(
-            async_sock,
-            mac,
-            dest_mac,
-            renew_xid,
-            ip,
-            None,
-            ip,
-            dest_ip,
-        ).await;
+        send_request(async_sock, mac, dest_mac, renew_xid, ip, None, ip, dest_ip).await;
         *renew_sent = Some(std::time::Instant::now());
     }
 }
@@ -291,20 +327,23 @@ async fn handle_incoming_packet(
     };
     let server_mac = eth.get_source();
 
-    if msg_type == dhcproto::v4::MessageType::Offer {
-        if let ClientState::Discovering { xid, .. } = state {
-            let offered_ip = dhcp.yiaddr();
-            let server_ip = get_server_identifier(&dhcp);
-            println!("[dhcp-client] Received DHCPOFFER for IP: {}, server: {:?}", offered_ip, server_ip);
-            *state = ClientState::Requesting {
-                xid: *xid,
-                offered_ip,
-                server_ip,
-                server_mac,
-                last_sent: std::time::Instant::now() - std::time::Duration::from_secs(10),
-                retry_delay_secs: 4,
-            };
-        }
+    if msg_type == dhcproto::v4::MessageType::Offer
+        && let ClientState::Discovering { xid, .. } = state
+    {
+        let offered_ip = dhcp.yiaddr();
+        let server_ip = get_server_identifier(&dhcp);
+        println!(
+            "[dhcp-client] Received DHCPOFFER for IP: {}, server: {:?}",
+            offered_ip, server_ip
+        );
+        *state = ClientState::Requesting {
+            xid: *xid,
+            offered_ip,
+            server_ip,
+            server_mac,
+            last_sent: std::time::Instant::now() - std::time::Duration::from_secs(10),
+            retry_delay_secs: 4,
+        };
     }
 
     if msg_type == dhcproto::v4::MessageType::Ack {
@@ -342,10 +381,11 @@ async fn handle_ack_received(
         changed
     };
 
-    if changed {
-        if let Err(e) = configure_wan(wan_interface, ip, mask, gateway).await {
-            println!("[dhcp-client] ERROR: Failed to configure WAN interface via netlink: {}", e);
-        }
+    if changed && let Err(e) = configure_wan(wan_interface, ip, mask, gateway).await {
+        println!(
+            "[dhcp-client] ERROR: Failed to configure WAN interface via netlink: {}",
+            e
+        );
     }
 
     *state = ClientState::Bound {
@@ -362,25 +402,32 @@ async fn handle_ack_received(
 }
 
 async fn send_discover(async_sock: &AsyncFd<RawFd>, mac: MacAddr, xid: u32) {
-    use dhcproto::{Encoder, Encodable};
-    use dhcproto::v4::{Message, DhcpOption, MessageType, OptionCode, Opcode, Flags};
+    use dhcproto::v4::{DhcpOption, Flags, Message, MessageType, Opcode, OptionCode};
+    use dhcproto::{Encodable, Encoder};
 
     let mut discover = Message::default();
     discover.set_opcode(Opcode::BootRequest);
     discover.set_xid(xid);
     discover.set_flags(Flags::default().set_broadcast());
     discover.set_chaddr(&[mac.0, mac.1, mac.2, mac.3, mac.4, mac.5]);
-    
-    discover.opts_mut().insert(DhcpOption::MessageType(MessageType::Discover));
-    discover.opts_mut().insert(DhcpOption::ParameterRequestList(vec![
-        OptionCode::SubnetMask,
-        OptionCode::Router,
-        OptionCode::DomainNameServer,
-    ]));
+
+    discover
+        .opts_mut()
+        .insert(DhcpOption::MessageType(MessageType::Discover));
+    discover
+        .opts_mut()
+        .insert(DhcpOption::ParameterRequestList(vec![
+            OptionCode::SubnetMask,
+            OptionCode::Router,
+            OptionCode::DomainNameServer,
+        ]));
 
     let mut discover_payload = Vec::new();
     if let Err(e) = discover.encode(&mut Encoder::new(&mut discover_payload)) {
-        println!("[dhcp-client] ERROR: Failed to encode DHCPDISCOVER payload: {}", e);
+        println!(
+            "[dhcp-client] ERROR: Failed to encode DHCPDISCOVER payload: {}",
+            e
+        );
         return;
     }
 
@@ -408,8 +455,8 @@ async fn send_request(
     ciaddr: Ipv4Addr,
     dest_ip: Ipv4Addr,
 ) {
-    use dhcproto::{Encoder, Encodable};
-    use dhcproto::v4::{Message, DhcpOption, MessageType, Opcode, Flags};
+    use dhcproto::v4::{DhcpOption, Flags, Message, MessageType, Opcode};
+    use dhcproto::{Encodable, Encoder};
 
     let mut request = Message::default();
     request.set_opcode(Opcode::BootRequest);
@@ -419,17 +466,24 @@ async fn send_request(
 
     if ciaddr.is_unspecified() {
         request.set_flags(Flags::default().set_broadcast());
-        request.opts_mut().insert(DhcpOption::RequestedIpAddress(requested_ip));
+        request
+            .opts_mut()
+            .insert(DhcpOption::RequestedIpAddress(requested_ip));
         if let Some(srv) = server_ip {
             request.opts_mut().insert(DhcpOption::ServerIdentifier(srv));
         }
     }
 
-    request.opts_mut().insert(DhcpOption::MessageType(MessageType::Request));
+    request
+        .opts_mut()
+        .insert(DhcpOption::MessageType(MessageType::Request));
 
     let mut req_payload = Vec::new();
     if let Err(e) = request.encode(&mut Encoder::new(&mut req_payload)) {
-        println!("[dhcp-client] ERROR: Failed to encode DHCPREQUEST payload: {}", e);
+        println!(
+            "[dhcp-client] ERROR: Failed to encode DHCPREQUEST payload: {}",
+            e
+        );
         return;
     }
 
@@ -444,7 +498,10 @@ async fn send_request(
     );
 
     send_raw_packet(async_sock, &req_frame).await;
-    println!("[dhcp-client] Sent DHCPREQUEST (ciaddr: {}, dest_ip: {}).", ciaddr, dest_ip);
+    println!(
+        "[dhcp-client] Sent DHCPREQUEST (ciaddr: {}, dest_ip: {}).",
+        ciaddr, dest_ip
+    );
 }
 
 async fn deconfigure_wan(
@@ -453,12 +510,19 @@ async fn deconfigure_wan(
     mask: Ipv4Addr,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let prefix_len = mask.octets().iter().map(|&x| x.count_ones()).sum::<u32>() as u8;
-    println!("[dhcp-client] Deconfiguring WAN interface via netlink: removing IP {}/{}", ip, prefix_len);
+    println!(
+        "[dhcp-client] Deconfiguring WAN interface via netlink: removing IP {}/{}",
+        ip, prefix_len
+    );
 
     let (connection, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(connection);
 
-    let mut links = handle.link().get().match_name(wan_interface.to_string()).execute();
+    let mut links = handle
+        .link()
+        .get()
+        .match_name(wan_interface.to_string())
+        .execute();
     let link = match links.try_next().await? {
         Some(l) => l,
         None => return Err(format!("Interface {} not found", wan_interface).into()),
@@ -471,11 +535,11 @@ async fn deconfigure_wan(
         if addr.header.index == index {
             let mut matches_ip = false;
             for nla in addr.attributes.iter() {
-                if let rtnetlink::packet_route::address::AddressAttribute::Local(ip_attr) = nla {
-                    if ip_attr == &std::net::IpAddr::V4(ip) {
-                        matches_ip = true;
-                        break;
-                    }
+                if let rtnetlink::packet_route::address::AddressAttribute::Local(ip_attr) = nla
+                    && ip_attr == &std::net::IpAddr::V4(ip)
+                {
+                    matches_ip = true;
+                    break;
                 }
             }
             if matches_ip {
@@ -501,7 +565,11 @@ async fn configure_wan(
     let (connection, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(connection);
 
-    let mut links = handle.link().get().match_name(wan_interface.to_string()).execute();
+    let mut links = handle
+        .link()
+        .get()
+        .match_name(wan_interface.to_string())
+        .execute();
     let link = match links.try_next().await? {
         Some(l) => l,
         None => return Err(format!("Interface {} not found", wan_interface).into()),
@@ -521,7 +589,11 @@ async fn configure_wan(
     handle.link().change(message).execute().await?;
 
     // Add new IP
-    handle.address().add(index, std::net::IpAddr::V4(ip), prefix_len).execute().await?;
+    handle
+        .address()
+        .add(index, std::net::IpAddr::V4(ip), prefix_len)
+        .execute()
+        .await?;
 
     // Add default route
     if let Some(gw) = gateway {
@@ -543,7 +615,9 @@ fn get_server_identifier(dhcp: &dhcproto::v4::Message) -> Option<Ipv4Addr> {
     }
 }
 
-fn parse_lease_options(dhcp: &dhcproto::v4::Message) -> (Ipv4Addr, Option<Ipv4Addr>, Vec<Ipv4Addr>, u32) {
+fn parse_lease_options(
+    dhcp: &dhcproto::v4::Message,
+) -> (Ipv4Addr, Option<Ipv4Addr>, Vec<Ipv4Addr>, u32) {
     use dhcproto::v4::DhcpOption;
     use dhcproto::v4::OptionCode;
 
@@ -551,7 +625,7 @@ fn parse_lease_options(dhcp: &dhcproto::v4::Message) -> (Ipv4Addr, Option<Ipv4Ad
         Some(DhcpOption::SubnetMask(m)) => *m,
         _ => Ipv4Addr::new(255, 255, 255, 0),
     };
-    
+
     let gateway = match dhcp.opts().get(OptionCode::Router) {
         Some(DhcpOption::Router(routers)) if !routers.is_empty() => Some(routers[0]),
         _ => None,

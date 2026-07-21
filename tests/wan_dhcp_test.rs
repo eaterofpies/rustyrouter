@@ -39,8 +39,8 @@ const DNS_RESPONSE: &[u8] = &[
     0x00, 0x01, // Answer RRs: 1
     0x00, 0x00, // Authority RRs: 0
     0x00, 0x00, // Additional RRs: 0
-    0x06, b'g', b'o', b'o', b'g', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
-    0x00, 0x01, // Type: A
+    0x06, b'g', b'o', b'o', b'g', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00,
+    0x01, // Type: A
     0x00, 0x01, // Class: IN
     0xc0, 0x0c, // Pointer to name
     0x00, 0x01, // Type: A
@@ -161,7 +161,10 @@ async fn startup_stage() -> TestEnv {
 
     // C. Start our mock WAN ISP gateway in a background task
     let wan_isp_handle = tokio::spawn(async move {
-        let (stream, _) = wan_listener.accept().await.expect("Failed to accept WAN connection from QEMU");
+        let (stream, _) = wan_listener
+            .accept()
+            .await
+            .expect("Failed to accept WAN connection from QEMU");
         let mock = UnixStreamMock::new(stream);
         run_mock_wan_isp(mock, verification_tx).await
     });
@@ -211,7 +214,7 @@ async fn startup_stage() -> TestEnv {
         .expect("Failed to spawn QEMU");
 
     // Capture child process ID for RAII kill guard
-    let qemu_kill_guard = qemu_child.id().map(|id| QemuKillGuard(id));
+    let qemu_kill_guard = qemu_child.id().map(QemuKillGuard);
 
     // Stream QEMU stdout/stderr
     let stdout = qemu_child.stdout.take().unwrap();
@@ -237,14 +240,17 @@ async fn startup_stage() -> TestEnv {
     let mut wan_dhcp_done = false;
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(35) {
-        if let Some(msg) = rx.recv().await {
-            if msg == "WAN_DHCP_DONE" {
-                wan_dhcp_done = true;
-                break;
-            }
+        if let Some(msg) = rx.recv().await
+            && msg == "WAN_DHCP_DONE"
+        {
+            wan_dhcp_done = true;
+            break;
         }
     }
-    assert!(wan_dhcp_done, "WAN DHCP lease timed out during startup stage");
+    assert!(
+        wan_dhcp_done,
+        "WAN DHCP lease timed out during startup stage"
+    );
     println!("[test-env] WAN DHCP lease acquired successfully!");
 
     // G. Connect LAN client mock to the QEMU-created socket
@@ -252,11 +258,12 @@ async fn startup_stage() -> TestEnv {
     let mut lan_stream = None;
     let start_lan = std::time::Instant::now();
     while start_lan.elapsed() < Duration::from_secs(10) {
-        if std::path::Path::new("/workspaces/rustyrouter/target/lan.sock").exists() {
-            if let Ok(stream) = tokio::net::UnixStream::connect("/workspaces/rustyrouter/target/lan.sock").await {
-                lan_stream = Some(stream);
-                break;
-            }
+        if std::path::Path::new("/workspaces/rustyrouter/target/lan.sock").exists()
+            && let Ok(stream) =
+                tokio::net::UnixStream::connect("/workspaces/rustyrouter/target/lan.sock").await
+        {
+            lan_stream = Some(stream);
+            break;
         }
         sleep(Duration::from_millis(100)).await;
     }
@@ -274,16 +281,27 @@ async fn startup_stage() -> TestEnv {
         67,
         &discover_payload,
     );
-    lan_client.send_frame(&discover_frame).await.expect("Failed to send LAN DHCPDISCOVER");
+    lan_client
+        .send_frame(&discover_frame)
+        .await
+        .expect("Failed to send LAN DHCPDISCOVER");
 
     // DHCPOFFER
-    let dhcp_offer = lan_client.recv_dhcp_packet().await.expect("Failed to receive DHCPOFFER");
+    let dhcp_offer = lan_client
+        .recv_dhcp_packet()
+        .await
+        .expect("Failed to receive DHCPOFFER");
     assert_eq!(dhcp_offer.xid(), 0x5678);
     let offered_ip = dhcp_offer.yiaddr();
     println!("[test-env] LAN Offered IP: {}", offered_ip);
 
     // DHCPREQUEST
-    let request_payload = build_dhcp_request_lan(0x5678, LAN_CLIENT_MAC, offered_ip, Ipv4Addr::new(192, 168, 1, 1));
+    let request_payload = build_dhcp_request_lan(
+        0x5678,
+        LAN_CLIENT_MAC,
+        offered_ip,
+        Ipv4Addr::new(192, 168, 1, 1),
+    );
     let request_frame = packet::build_raw_packet(
         LAN_CLIENT_MAC,
         MacAddr::broadcast(),
@@ -293,30 +311,46 @@ async fn startup_stage() -> TestEnv {
         67,
         &request_payload,
     );
-    lan_client.send_frame(&request_frame).await.expect("Failed to send LAN DHCPREQUEST");
+    lan_client
+        .send_frame(&request_frame)
+        .await
+        .expect("Failed to send LAN DHCPREQUEST");
 
     // DHCPACK
-    let dhcp_ack = lan_client.recv_dhcp_packet().await.expect("Failed to receive DHCPACK");
+    let dhcp_ack = lan_client
+        .recv_dhcp_packet()
+        .await
+        .expect("Failed to receive DHCPACK");
     assert_eq!(dhcp_ack.xid(), 0x5678);
     let leased_ip = dhcp_ack.yiaddr();
     println!("[test-env] LAN Client Bound to IP: {}", leased_ip);
 
     // Resolve Router Gateway MAC (192.168.1.1) via ARP
     let arp_req = build_arp_request(LAN_CLIENT_MAC, leased_ip, Ipv4Addr::new(192, 168, 1, 1));
-    lan_client.send_frame(&arp_req).await.expect("Failed to send LAN ARP request");
+    lan_client
+        .send_frame(&arp_req)
+        .await
+        .expect("Failed to send LAN ARP request");
 
     let mut router_lan_mac = MacAddr::zero();
     let start_arp = std::time::Instant::now();
     while start_arp.elapsed() < Duration::from_secs(5) {
-        let frame = lan_client.recv_frame().await.expect("Failed to read ARP reply");
-        if let Some((sender_mac, sender_ip)) = parse_arp_reply(&frame, leased_ip).ok().flatten() {
-            if sender_ip == Ipv4Addr::new(192, 168, 1, 1) {
-                router_lan_mac = sender_mac;
-                break;
-            }
+        let frame = lan_client
+            .recv_frame()
+            .await
+            .expect("Failed to read ARP reply");
+        if let Some((sender_mac, sender_ip)) = parse_arp_reply(&frame, leased_ip).ok().flatten()
+            && sender_ip == Ipv4Addr::new(192, 168, 1, 1)
+        {
+            router_lan_mac = sender_mac;
+            break;
         }
     }
-    assert_ne!(router_lan_mac, MacAddr::zero(), "Failed to resolve Gateway MAC via ARP");
+    assert_ne!(
+        router_lan_mac,
+        MacAddr::zero(),
+        "Failed to resolve Gateway MAC via ARP"
+    );
     println!("[test-env] Resolved Router LAN MAC: {}", router_lan_mac);
 
     TestEnv {
@@ -332,7 +366,11 @@ async fn startup_stage() -> TestEnv {
 
 async fn test_1_wan_and_lan_dhcp(env: &TestEnv) {
     assert!(env.leased_ip.is_some(), "LAN client IP was not leased");
-    assert_ne!(env.router_lan_mac, MacAddr::zero(), "Router LAN MAC was not resolved");
+    assert_ne!(
+        env.router_lan_mac,
+        MacAddr::zero(),
+        "Router LAN MAC was not resolved"
+    );
     println!("[test] DHCP and ARP startup verified successfully.");
 }
 
@@ -359,14 +397,18 @@ async fn test_2_nat_routing(env: &mut TestEnv) {
             last_send = std::time::Instant::now();
         }
 
-        if let Ok(Ok(frame)) = tokio::time::timeout(Duration::from_millis(100), env.lan_client.recv_frame()).await {
-            if let Some(true) = verify_icmp_reply(&frame).ok() {
-                ping_success = true;
-                break;
-            }
+        if let Ok(Ok(frame)) =
+            tokio::time::timeout(Duration::from_millis(100), env.lan_client.recv_frame()).await
+            && let Some(true) = verify_icmp_reply(&frame).ok()
+        {
+            ping_success = true;
+            break;
         }
     }
-    assert!(ping_success, "LAN client failed to receive ICMP Echo Reply from 8.8.8.8");
+    assert!(
+        ping_success,
+        "LAN client failed to receive ICMP Echo Reply from 8.8.8.8"
+    );
 
     // Verify WAN mock server received it too
     let mut icmp_verified = false;
@@ -382,7 +424,10 @@ async fn test_2_nat_routing(env: &mut TestEnv) {
             _ = sleep(Duration::from_millis(50)) => {}
         }
     }
-    assert!(icmp_verified, "WAN mock server did not verify NATed ICMP Request");
+    assert!(
+        icmp_verified,
+        "WAN mock server did not verify NATed ICMP Request"
+    );
     println!("[test] NAT Masquerading routing verified successfully.");
 }
 
@@ -404,22 +449,28 @@ async fn test_3_dns_forwarding(env: &mut TestEnv) {
                 Ipv4Addr::new(192, 168, 1, 1),
                 12345,
                 53,
-                &DNS_QUERY,
+                DNS_QUERY,
             );
             let _ = env.lan_client.send_frame(&dns_query_frame).await;
             last_send = std::time::Instant::now();
         }
 
-        if let Ok(Ok(frame)) = tokio::time::timeout(Duration::from_millis(100), env.lan_client.recv_frame()).await {
-            if let Some((_src_ip, _dest_ip, src_port, dest_port, payload)) = parse_dns_request(&frame).ok().flatten() {
-                if src_port == 53 && dest_port == 12345 && payload == DNS_RESPONSE {
-                    dns_success = true;
-                    break;
-                }
-            }
+        if let Ok(Ok(frame)) =
+            tokio::time::timeout(Duration::from_millis(100), env.lan_client.recv_frame()).await
+            && let Some((_src_ip, _dest_ip, src_port, dest_port, payload)) =
+                parse_dns_request(&frame).ok().flatten()
+            && src_port == 53
+            && dest_port == 12345
+            && payload == DNS_RESPONSE
+        {
+            dns_success = true;
+            break;
         }
     }
-    assert!(dns_success, "LAN client failed to receive valid DNS response");
+    assert!(
+        dns_success,
+        "LAN client failed to receive valid DNS response"
+    );
 
     // Verify WAN mock server received it too
     let mut dns_verified = false;
@@ -435,11 +486,17 @@ async fn test_3_dns_forwarding(env: &mut TestEnv) {
             _ = sleep(Duration::from_millis(50)) => {}
         }
     }
-    assert!(dns_verified, "WAN mock server did not verify forwarded DNS query");
+    assert!(
+        dns_verified,
+        "WAN mock server did not verify forwarded DNS query"
+    );
     println!("[test] DNS UDP forwarding verified successfully.");
 }
 
-async fn run_mock_wan_isp(mut mock: UnixStreamMock, verification_tx: tokio::sync::mpsc::Sender<String>) -> bool {
+async fn run_mock_wan_isp(
+    mut mock: UnixStreamMock,
+    verification_tx: tokio::sync::mpsc::Sender<String>,
+) -> bool {
     let xid;
     let client_mac;
 
@@ -453,7 +510,8 @@ async fn run_mock_wan_isp(mut mock: UnixStreamMock, verification_tx: tokio::sync
             println!("[isp-test] Timeout waiting for DHCPDISCOVER");
             return false;
         }
-        let frame = match tokio::time::timeout(Duration::from_millis(100), mock.recv_frame()).await {
+        let frame = match tokio::time::timeout(Duration::from_millis(100), mock.recv_frame()).await
+        {
             Ok(Ok(frame)) => frame,
             _ => continue,
         };
@@ -505,7 +563,8 @@ async fn run_mock_wan_isp(mut mock: UnixStreamMock, verification_tx: tokio::sync
             println!("[isp-test] Timeout waiting for DHCPREQUEST");
             return false;
         }
-        let frame = match tokio::time::timeout(Duration::from_millis(100), mock.recv_frame()).await {
+        let frame = match tokio::time::timeout(Duration::from_millis(100), mock.recv_frame()).await
+        {
             Ok(Ok(frame)) => frame,
             _ => continue,
         };
@@ -514,10 +573,10 @@ async fn run_mock_wan_isp(mut mock: UnixStreamMock, verification_tx: tokio::sync
             let msg_type = dhcp_request
                 .opts()
                 .get(dhcproto::v4::OptionCode::MessageType);
-            if let Some(dhcproto::v4::DhcpOption::MessageType(MessageType::Request)) = msg_type {
-                if dhcp_request.xid() == xid {
-                    break;
-                }
+            if let Some(dhcproto::v4::DhcpOption::MessageType(MessageType::Request)) = msg_type
+                && dhcp_request.xid() == xid
+            {
+                break;
             }
         }
     }
@@ -551,13 +610,18 @@ async fn run_mock_wan_isp(mut mock: UnixStreamMock, verification_tx: tokio::sync
         if start.elapsed() >= timeout_dur {
             break;
         }
-        let frame = match tokio::time::timeout(Duration::from_millis(100), mock.recv_frame()).await {
+        let frame = match tokio::time::timeout(Duration::from_millis(100), mock.recv_frame()).await
+        {
             Ok(Ok(frame)) => frame,
             _ => continue,
         };
 
         if let Some(eth) = pnet::packet::ethernet::EthernetPacket::new(&frame) {
-            println!("[isp-test] Received WAN frame: len={}, ethertype=0x{:04x}", frame.len(), eth.get_ethertype().0);
+            println!(
+                "[isp-test] Received WAN frame: len={}, ethertype=0x{:04x}",
+                frame.len(),
+                eth.get_ethertype().0
+            );
         }
 
         // A. Handle ARP requests for WAN gateway / DNS server
@@ -574,36 +638,35 @@ async fn run_mock_wan_isp(mut mock: UnixStreamMock, verification_tx: tokio::sync
                     let _ = verification_tx.send("ICMP_VERIFIED".to_string()).await;
                 }
                 // Send ICMP Echo Reply back from 8.8.8.8 to the NATed client IP
-                let icmp_reply = build_icmp_echo_reply(
-                    MOCK_SERVER_MAC,
-                    client_mac,
-                    dest_ip,
-                    src_ip,
-                    0x4321,
-                    1,
-                );
+                let icmp_reply =
+                    build_icmp_echo_reply(MOCK_SERVER_MAC, client_mac, dest_ip, src_ip, 0x4321, 1);
                 let _ = mock.send_frame(&icmp_reply).await;
             }
             continue;
         }
 
         // C. Handle DNS request to 10.0.2.3:53 (checks DNS forwarding)
-        if let Some((src_ip, dest_ip, src_port, dest_port, payload)) = parse_dns_request(&frame).ok().flatten() {
+        if let Some((src_ip, dest_ip, src_port, dest_port, payload)) =
+            parse_dns_request(&frame).ok().flatten()
+        {
             if dest_ip == MOCK_DNS_SERVER && dest_port == 53 {
                 if src_ip == MOCK_CLIENT_IP && payload == DNS_QUERY {
                     println!("[isp-test] Verified DNS Forwarder query on WAN!");
                     let _ = verification_tx.send("DNS_VERIFIED".to_string()).await;
                 }
-                println!("[isp-test] Sending DNS Reply to {}:{} from {}:{} with client MAC: {}", src_ip, src_port, dest_ip, dest_port, client_mac);
+                println!(
+                    "[isp-test] Sending DNS Reply to {}:{} from {}:{} with client MAC: {}",
+                    src_ip, src_port, dest_ip, dest_port, client_mac
+                );
                 // Send DNS Reply from 10.0.2.3:53 back to the NATed source
                 let dns_reply = build_udp_packet(
                     MOCK_SERVER_MAC,
                     client_mac,
-                    dest_ip, // 10.0.2.3 (source)
-                    src_ip,  // 10.0.2.15 (destination)
+                    dest_ip,   // 10.0.2.3 (source)
+                    src_ip,    // 10.0.2.15 (destination)
                     dest_port, // 53 (source port)
                     src_port,  // router's ephemeral port (destination port)
-                    &DNS_RESPONSE,
+                    DNS_RESPONSE,
                 );
                 let _ = mock.send_frame(&dns_reply).await;
             }
@@ -728,7 +791,12 @@ fn build_dhcp_discover_lan(xid: u32, client_mac: MacAddr) -> Vec<u8> {
     payload
 }
 
-fn build_dhcp_request_lan(xid: u32, client_mac: MacAddr, requested_ip: Ipv4Addr, server_ip: Ipv4Addr) -> Vec<u8> {
+fn build_dhcp_request_lan(
+    xid: u32,
+    client_mac: MacAddr,
+    requested_ip: Ipv4Addr,
+    server_ip: Ipv4Addr,
+) -> Vec<u8> {
     use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode};
     use dhcproto::{Encodable, Encoder};
 
@@ -889,10 +957,10 @@ fn build_arp_reply(
     target_ip: Ipv4Addr,
 ) -> Vec<u8> {
     use pnet::packet::MutablePacket;
-    use pnet::packet::ethernet::MutableEthernetPacket;
-    use pnet::packet::arp::MutableArpPacket;
     use pnet::packet::arp::ArpHardwareTypes;
+    use pnet::packet::arp::MutableArpPacket;
     use pnet::packet::ethernet::EtherTypes;
+    use pnet::packet::ethernet::MutableEthernetPacket;
 
     let eth_header_len = MutableEthernetPacket::minimum_packet_size();
     let arp_header_len = MutableArpPacket::minimum_packet_size();
@@ -920,16 +988,12 @@ fn build_arp_reply(
     buf
 }
 
-fn build_arp_request(
-    sender_mac: MacAddr,
-    sender_ip: Ipv4Addr,
-    target_ip: Ipv4Addr,
-) -> Vec<u8> {
+fn build_arp_request(sender_mac: MacAddr, sender_ip: Ipv4Addr, target_ip: Ipv4Addr) -> Vec<u8> {
     use pnet::packet::MutablePacket;
-    use pnet::packet::ethernet::MutableEthernetPacket;
-    use pnet::packet::arp::MutableArpPacket;
     use pnet::packet::arp::ArpHardwareTypes;
+    use pnet::packet::arp::MutableArpPacket;
     use pnet::packet::ethernet::EtherTypes;
+    use pnet::packet::ethernet::MutableEthernetPacket;
 
     let eth_header_len = MutableEthernetPacket::minimum_packet_size();
     let arp_header_len = MutableArpPacket::minimum_packet_size();
@@ -961,7 +1025,8 @@ fn handle_arp_request(frame: &[u8]) -> Result<Option<Vec<u8>>, Box<dyn std::erro
     if frame.len() < 42 {
         return Ok(None);
     }
-    let eth = pnet::packet::ethernet::EthernetPacket::new(frame).ok_or("Malformed Ethernet frame")?;
+    let eth =
+        pnet::packet::ethernet::EthernetPacket::new(frame).ok_or("Malformed Ethernet frame")?;
     if eth.get_ethertype() != pnet::packet::ethernet::EtherTypes::Arp {
         return Ok(None);
     }
@@ -981,28 +1046,38 @@ fn handle_arp_request(frame: &[u8]) -> Result<Option<Vec<u8>>, Box<dyn std::erro
     Ok(None)
 }
 
-fn parse_arp_reply(frame: &[u8], expected_target_ip: Ipv4Addr) -> Result<Option<(MacAddr, Ipv4Addr)>, Box<dyn std::error::Error>> {
+fn parse_arp_reply(
+    frame: &[u8],
+    expected_target_ip: Ipv4Addr,
+) -> Result<Option<(MacAddr, Ipv4Addr)>, Box<dyn std::error::Error>> {
     if frame.len() < 42 {
         return Ok(None);
     }
-    let eth = pnet::packet::ethernet::EthernetPacket::new(frame).ok_or("Malformed Ethernet frame")?;
+    let eth =
+        pnet::packet::ethernet::EthernetPacket::new(frame).ok_or("Malformed Ethernet frame")?;
     if eth.get_ethertype() != pnet::packet::ethernet::EtherTypes::Arp {
         return Ok(None);
     }
     let arp = pnet::packet::arp::ArpPacket::new(eth.payload()).ok_or("Malformed ARP packet")?;
-    if arp.get_operation() == pnet::packet::arp::ArpOperations::Reply {
-        if arp.get_target_proto_addr() == expected_target_ip {
-            return Ok(Some((arp.get_sender_hw_addr(), arp.get_sender_proto_addr())));
-        }
+    if arp.get_operation() == pnet::packet::arp::ArpOperations::Reply
+        && arp.get_target_proto_addr() == expected_target_ip
+    {
+        return Ok(Some((
+            arp.get_sender_hw_addr(),
+            arp.get_sender_proto_addr(),
+        )));
     }
     Ok(None)
 }
 
-fn parse_icmp_request(frame: &[u8]) -> Result<Option<(Ipv4Addr, Ipv4Addr)>, Box<dyn std::error::Error>> {
+fn parse_icmp_request(
+    frame: &[u8],
+) -> Result<Option<(Ipv4Addr, Ipv4Addr)>, Box<dyn std::error::Error>> {
     if frame.len() < 42 {
         return Ok(None);
     }
-    let eth = pnet::packet::ethernet::EthernetPacket::new(frame).ok_or("Malformed Ethernet frame")?;
+    let eth =
+        pnet::packet::ethernet::EthernetPacket::new(frame).ok_or("Malformed Ethernet frame")?;
     if eth.get_ethertype() != pnet::packet::ethernet::EtherTypes::Ipv4 {
         return Ok(None);
     }
@@ -1017,11 +1092,14 @@ fn parse_icmp_request(frame: &[u8]) -> Result<Option<(Ipv4Addr, Ipv4Addr)>, Box<
     Ok(None)
 }
 
-fn parse_dns_request(frame: &[u8]) -> Result<Option<(Ipv4Addr, Ipv4Addr, u16, u16, Vec<u8>)>, Box<dyn std::error::Error>> {
+fn parse_dns_request(
+    frame: &[u8],
+) -> Result<Option<(Ipv4Addr, Ipv4Addr, u16, u16, Vec<u8>)>, Box<dyn std::error::Error>> {
     if frame.len() < 42 {
         return Ok(None);
     }
-    let eth = pnet::packet::ethernet::EthernetPacket::new(frame).ok_or("Malformed Ethernet frame")?;
+    let eth =
+        pnet::packet::ethernet::EthernetPacket::new(frame).ok_or("Malformed Ethernet frame")?;
     if eth.get_ethertype() != pnet::packet::ethernet::EtherTypes::Ipv4 {
         return Ok(None);
     }

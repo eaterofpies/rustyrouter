@@ -1,8 +1,8 @@
+use super::utils::WanLease;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use super::utils::WanLease;
 
 // =========================================================================
 // DNS Constants & Config
@@ -30,14 +30,15 @@ struct CacheEntry {
 
 type SharedCache = Arc<Mutex<HashMap<Vec<u8>, CacheEntry>>>;
 
-pub async fn start_dns_forwarder(
-    lease_state: Arc<Mutex<WanLease>>,
-) {
+pub async fn start_dns_forwarder(lease_state: Arc<Mutex<WanLease>>) {
     let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), DNS_PORT);
     let socket = match tokio::net::UdpSocket::bind(addr).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[dns-forwarder] Failed to bind to 0.0.0.0:{}: {}. Retrying in 5s...", DNS_PORT, e);
+            eprintln!(
+                "[dns-forwarder] Failed to bind to 0.0.0.0:{}: {}. Retrying in 5s...",
+                DNS_PORT, e
+            );
             tokio::time::sleep(Duration::from_secs(5)).await;
             return;
         }
@@ -64,7 +65,10 @@ pub async fn start_dns_forwarder(
         let (len, src) = match socket.recv_from(&mut buf).await {
             Ok(res) => res,
             Err(e) => {
-                eprintln!("[dns-forwarder] Socket receive error: {}. Retrying in 1s...", e);
+                eprintln!(
+                    "[dns-forwarder] Socket receive error: {}. Retrying in 1s...",
+                    e
+                );
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -105,7 +109,7 @@ async fn handle_dns_query(
     }
 
     let upstream_dns = get_upstream_dns(&lease_state);
-    
+
     if let Some(response) = forward_query(&query, upstream_dns).await {
         insert_cache(cache_key, response.clone(), &cache);
         let _ = socket.send_to(&response, src).await;
@@ -146,7 +150,9 @@ fn insert_cache(
         Ok(p) => p,
         Err(_) => return,
     };
-    let ttl = packet.answers.iter()
+    let ttl = packet
+        .answers
+        .iter()
         .map(|ans| ans.ttl)
         .min()
         .unwrap_or(DEFAULT_TTL_SECS);
@@ -177,14 +183,12 @@ fn get_upstream_dns(lease_state: &Mutex<WanLease>) -> Ipv4Addr {
 async fn forward_query(query: &[u8], upstream_dns: Ipv4Addr) -> Option<Vec<u8>> {
     let upstream_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(upstream_dns), DNS_PORT);
     let upstream_sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
-    
+
     upstream_sock.send_to(query, upstream_addr).await.ok()?;
 
     let mut resp_buf = [0u8; RECV_BUF_SIZE];
-    let recv_res = tokio::time::timeout(
-        UPSTREAM_TIMEOUT,
-        upstream_sock.recv_from(&mut resp_buf),
-    ).await;
+    let recv_res =
+        tokio::time::timeout(UPSTREAM_TIMEOUT, upstream_sock.recv_from(&mut resp_buf)).await;
 
     let resp_len = match recv_res {
         Ok(Ok((len, _))) => len,
@@ -206,7 +210,9 @@ mod tests {
         // DNS header (12 bytes) + "google.com" question + Type A (2 bytes) + Class IN (2 bytes)
         let mut query = vec![0u8; DNS_HEADER_SIZE];
         query[5] = 1; // QDCount = 1
-        query.extend_from_slice(&[6, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0]);
+        query.extend_from_slice(&[
+            6, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
         query.extend_from_slice(&[0, 1]); // Type A
         query.extend_from_slice(&[0, 1]); // Class IN
 
@@ -225,7 +231,9 @@ mod tests {
         // Build a raw DNS response with answers having TTL 300 and 150
         let mut resp = vec![0u8; DNS_HEADER_SIZE];
         // Question: "google.com", Type A, Class IN
-        resp.extend_from_slice(&[6, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0]);
+        resp.extend_from_slice(&[
+            6, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
         resp.extend_from_slice(&[0, 1]); // Type A
         resp.extend_from_slice(&[0, 1]); // Class IN
 
@@ -255,6 +263,6 @@ mod tests {
         let lock = cache.lock().unwrap();
         let entry = lock.get(&b"key".to_vec()[..]).unwrap();
         let cache_ttl = entry.expiry.duration_since(Instant::now()).as_secs();
-        assert!(cache_ttl >= 148 && cache_ttl <= 150);
+        assert!((148..=150).contains(&cache_ttl));
     }
 }

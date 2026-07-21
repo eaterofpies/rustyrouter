@@ -49,19 +49,18 @@ async fn main() {
     let sys = Arc::new(RealSystem);
 
     // For PID 1, redirect standard descriptors (0, 1, 2) to /dev/console
-    if sys.getpid() == Pid::from_raw(1) {
-        if let Ok(console) = std::fs::OpenOptions::new()
+    if sys.getpid() == Pid::from_raw(1)
+        && let Ok(console) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open("/dev/console")
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = console.as_raw_fd();
-            unsafe {
-                libc::dup2(fd, 0);
-                libc::dup2(fd, 1);
-                libc::dup2(fd, 2);
-            }
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = console.as_raw_fd();
+        unsafe {
+            libc::dup2(fd, 0);
+            libc::dup2(fd, 1);
+            libc::dup2(fd, 2);
         }
     }
 

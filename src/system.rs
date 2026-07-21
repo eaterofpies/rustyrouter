@@ -19,7 +19,11 @@ pub trait SystemOps: Send + Sync + 'static {
 
     fn reboot(&self, mode: RebootMode) -> Result<(), nix::Error>;
 
-    fn waitpid(&self, pid: Option<Pid>, options: Option<WaitPidFlag>) -> Result<WaitStatus, nix::Error>;
+    fn waitpid(
+        &self,
+        pid: Option<Pid>,
+        options: Option<WaitPidFlag>,
+    ) -> Result<WaitStatus, nix::Error>;
 
     fn read_cmdline(&self) -> Result<String, std::io::Error>;
 
@@ -38,7 +42,10 @@ impl SystemOps for RealSystem {
         data: Option<&str>,
     ) -> Result<(), nix::Error> {
         if self.getpid() != Pid::from_raw(1) {
-            println!("[sys] Skipping mount of {} -> {} (not PID 1)", fstype, target);
+            println!(
+                "[sys] Skipping mount of {} -> {} (not PID 1)",
+                fstype, target
+            );
             return Ok(());
         }
         nix::mount::mount(source, target, Some(fstype), flags, data)
@@ -48,7 +55,11 @@ impl SystemOps for RealSystem {
         nix::sys::reboot::reboot(mode).map(|_| ())
     }
 
-    fn waitpid(&self, pid: Option<Pid>, options: Option<WaitPidFlag>) -> Result<WaitStatus, nix::Error> {
+    fn waitpid(
+        &self,
+        pid: Option<Pid>,
+        options: Option<WaitPidFlag>,
+    ) -> Result<WaitStatus, nix::Error> {
         nix::sys::wait::waitpid(pid, options)
     }
 
@@ -159,7 +170,11 @@ pub mod mock {
             Ok(())
         }
 
-        fn waitpid(&self, _pid: Option<Pid>, _options: Option<WaitPidFlag>) -> Result<WaitStatus, nix::Error> {
+        fn waitpid(
+            &self,
+            _pid: Option<Pid>,
+            _options: Option<WaitPidFlag>,
+        ) -> Result<WaitStatus, nix::Error> {
             let mut list = self.waitpid_results.lock().unwrap();
             if list.is_empty() {
                 Ok(WaitStatus::StillAlive)
@@ -170,7 +185,10 @@ pub mod mock {
 
         fn read_cmdline(&self) -> Result<String, std::io::Error> {
             if self.cmdline_content.is_empty() {
-                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "No cmdline mock"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "No cmdline mock",
+                ))
             } else {
                 Ok(self.cmdline_content.clone())
             }
@@ -257,12 +275,12 @@ fn find_module_file(name: &str) -> Option<std::path::PathBuf> {
 fn load_module(path: &Path) -> Result<(), std::io::Error> {
     println!("[init] Loading kernel module: {:?}", path);
     let file = fs::File::open(path)?;
-    
+
     let param = std::ffi::CString::new("").unwrap();
-    if let Err(e) = nix::kmod::finit_module(&file, &param, nix::kmod::ModuleInitFlags::empty()) {
-        if e != nix::errno::Errno::EEXIST {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
-        }
+    if let Err(e) = nix::kmod::finit_module(&file, &param, nix::kmod::ModuleInitFlags::empty())
+        && e != nix::errno::Errno::EEXIST
+    {
+        return Err(std::io::Error::other(e.to_string()));
     }
     Ok(())
 }
@@ -271,7 +289,10 @@ fn load_single_module(mod_name: &str) {
     let path = match find_module_file(mod_name) {
         Some(p) => p,
         None => {
-            println!("[init] Module {} not found in /lib/modules, assuming built-in or not needed.", mod_name);
+            println!(
+                "[init] Module {} not found in /lib/modules, assuming built-in or not needed.",
+                mod_name
+            );
             return;
         }
     };
