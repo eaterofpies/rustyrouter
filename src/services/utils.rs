@@ -202,3 +202,8 @@ pub async fn send_raw_packet(
         }
     }
 }
+
+pub fn get_timestamp_prefix() -> String {
+    let now = chrono::Utc::now();
+    now.format("[%Y-%m-%dT%H:%M:%S%.3fZ] ").to_string()
+}

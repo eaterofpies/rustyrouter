@@ -21,6 +21,7 @@ dhcproto = "0.15.0"
 rand = "0.10.2"
 ipnet = "2.12.0"
 dns-parser = "0.8.0"
+chrono = { version = "0.4", features = ["clock"] }
 
 
 

@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_macros)]
+
 use dhcproto::Decodable;
 use pnet::packet::Packet;
 use pnet::util::MacAddr;
@@ -10,6 +12,23 @@ use tokio::time::sleep;
 
 #[path = "../src/packet.rs"]
 mod packet;
+
+#[path = "../src/services/utils.rs"]
+mod utils;
+
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        std::print!("{}", utils::get_timestamp_prefix());
+        std::println!($($arg)*);
+    }};
+}
+
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        std::eprint!("{}", utils::get_timestamp_prefix());
+        std::eprintln!($($arg)*);
+    }};
+}
 
 const MOCK_SERVER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
 const MOCK_CLIENT_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
@@ -111,24 +130,24 @@ struct TestEnv {
 
 macro_rules! run_step {
     ($name:expr, $future:expr, $passed:ident, $failed:ident) => {
-        print!("test {} ... ", $name);
+        std::print!("test {} ... ", $name);
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
         let start = std::time::Instant::now();
         let result = std::panic::AssertUnwindSafe($future).catch_unwind().await;
         match result {
             Ok(_) => {
-                println!("ok (in {:.2?})", start.elapsed());
+                std::println!("ok (in {:.2?})", start.elapsed());
                 $passed += 1;
             }
             Err(payload) => {
-                println!("FAILED");
+                std::println!("FAILED");
                 $failed += 1;
                 if let Some(s) = payload.downcast_ref::<&str>() {
-                    println!("\nstep {} panicked: {}\n", $name, s);
+                    std::println!("\nstep {} panicked: {}\n", $name, s);
                 } else if let Some(s) = payload.downcast_ref::<String>() {
-                    println!("\nstep {} panicked: {}\n", $name, s);
+                    std::println!("\nstep {} panicked: {}\n", $name, s);
                 } else {
-                    println!("\nstep {} panicked with unknown error\n", $name);
+                    std::println!("\nstep {} panicked with unknown error\n", $name);
                 }
                 break;
             }
@@ -140,7 +159,7 @@ macro_rules! run_step {
 async fn main() {
     use futures_util::FutureExt;
 
-    println!("\nrunning 4 test steps");
+    std::println!("\nrunning 4 test steps");
     let mut env = startup_stage().await;
 
     let mut passed = 0;
@@ -172,7 +191,7 @@ async fn main() {
     }
 
     // Tear down VM cleanly
-    println!("\n=== Cleaning up QEMU VM... ===");
+    std::println!("\n=== Cleaning up QEMU VM... ===");
     drop(env._qemu_guard);
     let _ = env._qemu_child.kill().await;
     let _ = env._wan_isp_handle.await;
@@ -183,15 +202,19 @@ async fn main() {
 
     let elapsed = start_time.elapsed();
     if failed > 0 {
-        println!(
+        std::println!(
             "\ntest result: FAILED. {} passed; {} failed; finished in {:.2?}\n",
-            passed, failed, elapsed
+            passed,
+            failed,
+            elapsed
         );
         std::process::exit(101);
     } else {
-        println!(
+        std::println!(
             "\ntest result: ok. {} passed; {} failed; finished in {:.2?}\n",
-            passed, failed, elapsed
+            passed,
+            failed,
+            elapsed
         );
         std::process::exit(0);
     }

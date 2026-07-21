@@ -1,3 +1,19 @@
+#[macro_export]
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        std::print!("{}", $crate::services::utils::get_timestamp_prefix());
+        std::println!($($arg)*);
+    }};
+}
+
+#[macro_export]
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        std::eprint!("{}", $crate::services::utils::get_timestamp_prefix());
+        std::eprintln!($($arg)*);
+    }};
+}
+
 mod config;
 mod netfilter;
 mod network;
