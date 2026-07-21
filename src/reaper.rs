@@ -1,18 +1,21 @@
 use crate::system::SystemOps;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::signal::unix::{signal, SignalKind};
-use tokio::time::{sleep, Duration};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::time::{Duration, sleep};
 
 pub async fn start_orphan_reaper<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<AtomicBool>) {
     println!("[reaper] Starting orphan process reaper task...");
-    
+
     let mut sigchld_stream = match signal(SignalKind::child()) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[reaper] Error creating SIGCHLD stream: {}. Falling back to polling.", e);
+            eprintln!(
+                "[reaper] Error creating SIGCHLD stream: {}. Falling back to polling.",
+                e
+            );
             while !shutdown_flag.load(Ordering::Relaxed) {
                 reap_zombies(sys.as_ref());
                 sleep(Duration::from_millis(500)).await;
@@ -37,10 +40,16 @@ pub fn reap_zombies<S: SystemOps>(sys: &S) {
     loop {
         match sys.waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(pid, code)) => {
-                println!("[reaper] Reaped child process (PID {}) which exited with status {}", pid, code);
+                println!(
+                    "[reaper] Reaped child process (PID {}) which exited with status {}",
+                    pid, code
+                );
             }
             Ok(WaitStatus::Signaled(pid, sig, _)) => {
-                println!("[reaper] Reaped child process (PID {}) which terminated with signal {}", pid, sig);
+                println!(
+                    "[reaper] Reaped child process (PID {}) which terminated with signal {}",
+                    pid, sig
+                );
             }
             Ok(WaitStatus::StillAlive) => {
                 break;
@@ -67,11 +76,15 @@ mod tests {
     #[test]
     fn test_zombie_reaping() {
         let sys = MockSystem::new();
-        
+
         {
             let mut results = sys.waitpid_results.lock().unwrap();
             results.push(Ok(WaitStatus::Exited(Pid::from_raw(42), 0)));
-            results.push(Ok(WaitStatus::Signaled(Pid::from_raw(43), nix::sys::signal::Signal::SIGKILL, false)));
+            results.push(Ok(WaitStatus::Signaled(
+                Pid::from_raw(43),
+                nix::sys::signal::Signal::SIGKILL,
+                false,
+            )));
             results.push(Err(nix::Error::ECHILD));
         }
 

@@ -22,11 +22,17 @@ pub async fn configure_network(
     }
 
     // 4. Configure LAN interface
-    println!("[network] Configuring LAN interface ({}) with IP {}...", lan_iface, lan_ip_cidr);
+    println!(
+        "[network] Configuring LAN interface ({}) with IP {}...",
+        lan_iface, lan_ip_cidr
+    );
     configure_interface(&handle, lan_iface, Some(lan_ip_cidr)).await?;
 
     // 5. Configure WAN interface (Link UP only)
-    println!("[network] Configuring WAN interface ({}) link UP...", wan_iface);
+    println!(
+        "[network] Configuring WAN interface ({}) link UP...",
+        wan_iface
+    );
     configure_interface(&handle, wan_iface, None).await?;
 
     Ok(())
@@ -69,7 +75,10 @@ async fn configure_interface(
                 // Address already exists (EEXIST), ignore silently
             }
             Err(e) => {
-                println!("[network] Address assignment message for {} ({}): {}", name, cidr, e);
+                println!(
+                    "[network] Address assignment message for {} ({}): {}",
+                    name, cidr, e
+                );
             }
         }
     }

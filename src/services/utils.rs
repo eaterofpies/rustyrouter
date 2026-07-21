@@ -42,12 +42,15 @@ pub async fn get_interface_mac(ifname: &str) -> Result<pnet::util::MacAddr, Stri
             ));
         }
     }
-    
-    Err(format!("No hardware address attribute found for interface {}", ifname))
+
+    Err(format!(
+        "No hardware address attribute found for interface {}",
+        ifname
+    ))
 }
 
 pub fn open_raw_socket(ifname: &str) -> Result<RawFd, String> {
-    use socket2::{Domain, Protocol, Socket, Type, SockAddr};
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
     use std::os::unix::io::IntoRawFd;
 
     // Create the packet raw socket
@@ -55,10 +58,12 @@ pub fn open_raw_socket(ifname: &str) -> Result<RawFd, String> {
         Domain::from(libc::AF_PACKET),
         Type::RAW,
         Some(Protocol::from((libc::ETH_P_ALL as u16).to_be() as i32)),
-    ).map_err(|e| format!("socket(AF_PACKET) failed: {}", e))?;
+    )
+    .map_err(|e| format!("socket(AF_PACKET) failed: {}", e))?;
 
     // Enable nonblocking mode in pure Rust
-    socket.set_nonblocking(true)
+    socket
+        .set_nonblocking(true)
         .map_err(|e| format!("Failed to set nonblocking mode: {}", e))?;
 
     // Resolve interface name to its index
@@ -89,19 +94,20 @@ pub fn open_raw_socket(ifname: &str) -> Result<RawFd, String> {
         )
     };
 
-    socket.bind(&sockaddr)
+    socket
+        .bind(&sockaddr)
         .map_err(|e| format!("bind(AF_PACKET) failed: {}", e))?;
 
     Ok(socket.into_raw_fd())
 }
 
 pub fn parse_dhcp_payload(buf: &[u8], expected_port: u16) -> Option<dhcproto::v4::Message> {
+    use dhcproto::v4::Message;
+    use dhcproto::{Decodable, Decoder};
+    use pnet::packet::Packet;
     use pnet::packet::ethernet::EthernetPacket;
     use pnet::packet::ipv4::Ipv4Packet;
     use pnet::packet::udp::UdpPacket;
-    use pnet::packet::Packet;
-    use dhcproto::{Decoder, Decodable};
-    use dhcproto::v4::Message;
 
     let eth_pkt = EthernetPacket::new(buf)?;
     if eth_pkt.get_ethertype() != pnet::packet::ethernet::EtherTypes::Ipv4 {
@@ -125,7 +131,12 @@ pub fn try_read_raw(
     use std::os::unix::io::AsRawFd;
     match guard.try_io(|inner| {
         let res = unsafe {
-            libc::recv(inner.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
+            libc::recv(
+                inner.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                0,
+            )
         };
         if res < 0 {
             Err(std::io::Error::last_os_error())
@@ -157,7 +168,12 @@ pub fn try_write_raw(
     use std::os::unix::io::AsRawFd;
     match guard.try_io(|inner| {
         let res = unsafe {
-            libc::send(inner.as_raw_fd(), frame.as_ptr() as *const libc::c_void, frame.len(), 0)
+            libc::send(
+                inner.as_raw_fd(),
+                frame.as_ptr() as *const libc::c_void,
+                frame.len(),
+                0,
+            )
         };
         if res < 0 {
             Err(std::io::Error::last_os_error())

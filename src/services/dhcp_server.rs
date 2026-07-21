@@ -1,12 +1,14 @@
+use super::utils::{
+    get_interface_mac, open_raw_socket, parse_dhcp_payload, read_raw_packet, send_raw_packet,
+};
 use crate::packet::build_raw_packet;
-use pnet::util::MacAddr;
 use pnet::packet::ethernet::EthernetPacket;
+use pnet::util::MacAddr;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
-use super::utils::{get_interface_mac, open_raw_socket, parse_dhcp_payload, read_raw_packet, send_raw_packet};
 
 // =========================================================================
 // DHCP Server (LAN)
@@ -17,35 +19,42 @@ struct ClientLease {
     expiry: Instant,
 }
 
-async fn setup_server_socket(lan_interface: &str) -> Result<(MacAddr, RawFd, AsyncFd<RawFd>), String> {
-    let mac = get_interface_mac(lan_interface).await
+async fn setup_server_socket(
+    lan_interface: &str,
+) -> Result<(MacAddr, RawFd, AsyncFd<RawFd>), String> {
+    let mac = get_interface_mac(lan_interface)
+        .await
         .map_err(|e| format!("Failed to get MAC address: {}", e))?;
-    let raw_fd = open_raw_socket(lan_interface)
-        .map_err(|e| format!("Failed to open raw socket: {}", e))?;
-    let async_sock = AsyncFd::new(raw_fd)
-        .map_err(|e| {
-            unsafe { libc::close(raw_fd); }
-            format!("Failed to wrap raw socket: {}", e)
-        })?;
+    let raw_fd =
+        open_raw_socket(lan_interface).map_err(|e| format!("Failed to open raw socket: {}", e))?;
+    let async_sock = AsyncFd::new(raw_fd).map_err(|e| {
+        unsafe {
+            libc::close(raw_fd);
+        }
+        format!("Failed to wrap raw socket: {}", e)
+    })?;
     Ok((mac, raw_fd, async_sock))
 }
 
-pub async fn start_dhcp_server(
-    lan_interface: String,
-    lan_ip: String,
-) {
-    println!("[dhcp-server] Starting LAN DHCP server on {}...", lan_interface);
+pub async fn start_dhcp_server(lan_interface: String, lan_ip: String) {
+    println!(
+        "[dhcp-server] Starting LAN DHCP server on {}...",
+        lan_interface
+    );
 
     // Parse LAN IP (e.g. 192.168.1.1/24)
-    let net: ipnet::Ipv4Net = lan_ip.parse().unwrap_or_else(|_| {
-        "192.168.1.1/24".parse().unwrap()
-    });
+    let net: ipnet::Ipv4Net = lan_ip
+        .parse()
+        .unwrap_or_else(|_| "192.168.1.1/24".parse().unwrap());
     let server_ip = net.addr();
     let subnet_mask = net.netmask();
 
     let start_ip = Ipv4Addr::from(u32::from(net.network()) + 1);
     let end_ip = Ipv4Addr::from(u32::from(net.broadcast()) - 1);
-    println!("[dhcp-server] Dynamic lease pool: {} to {}", start_ip, end_ip);
+    println!(
+        "[dhcp-server] Dynamic lease pool: {} to {}",
+        start_ip, end_ip
+    );
 
     let mut leases: HashMap<MacAddr, ClientLease> = HashMap::new();
 
@@ -59,16 +68,11 @@ pub async fn start_dhcp_server(
             }
         };
 
-        run_server_loop(
-            &async_sock,
-            server_ip,
-            subnet_mask,
-            mac,
-            &mut leases,
-            net,
-        ).await;
+        run_server_loop(&async_sock, server_ip, subnet_mask, mac, &mut leases, net).await;
 
-        unsafe { libc::close(raw_fd); }
+        unsafe {
+            libc::close(raw_fd);
+        }
         println!("[dhcp-server] Socket closed. Restarting server loop in 5s...");
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
@@ -98,7 +102,8 @@ async fn run_server_loop(
             mac,
             leases,
             net,
-        ).await;
+        )
+        .await;
     }
 }
 
@@ -134,7 +139,10 @@ async fn process_incoming_packet(
     };
     let src_mac = eth.get_source();
     if dhcp.giaddr().is_unspecified() && src_mac != client_mac {
-        eprintln!("[dhcp-server] WARNING: Dropping spoofed DHCP packet: L2 source MAC ({}) does not match chaddr ({})!", src_mac, client_mac);
+        eprintln!(
+            "[dhcp-server] WARNING: Dropping spoofed DHCP packet: L2 source MAC ({}) does not match chaddr ({})!",
+            src_mac, client_mac
+        );
         return;
     }
 
@@ -154,7 +162,8 @@ async fn process_incoming_packet(
                 client_mac,
                 leases,
                 net,
-            ).await;
+            )
+            .await;
         }
         dhcproto::v4::MessageType::Request => {
             handle_dhcp_request(
@@ -165,7 +174,8 @@ async fn process_incoming_packet(
                 &dhcp,
                 client_mac,
                 leases,
-            ).await;
+            )
+            .await;
         }
         dhcproto::v4::MessageType::Decline => {
             handle_dhcp_decline(client_mac, leases);
@@ -177,21 +187,21 @@ async fn process_incoming_packet(
     }
 }
 
-fn handle_dhcp_decline(
-    client_mac: MacAddr,
-    leases: &mut HashMap<MacAddr, ClientLease>,
-) {
+fn handle_dhcp_decline(client_mac: MacAddr, leases: &mut HashMap<MacAddr, ClientLease>) {
     if let Some(lease) = leases.remove(&client_mac) {
-        println!("[dhcp-server] Received DHCPDECLINE from client MAC: {}. Removed lease for IP: {}.", client_mac, lease.ip);
+        println!(
+            "[dhcp-server] Received DHCPDECLINE from client MAC: {}. Removed lease for IP: {}.",
+            client_mac, lease.ip
+        );
     }
 }
 
-fn handle_dhcp_release(
-    client_mac: MacAddr,
-    leases: &mut HashMap<MacAddr, ClientLease>,
-) {
+fn handle_dhcp_release(client_mac: MacAddr, leases: &mut HashMap<MacAddr, ClientLease>) {
     if let Some(lease) = leases.remove(&client_mac) {
-        println!("[dhcp-server] Received DHCPRELEASE from client MAC: {}. Released lease for IP: {}.", client_mac, lease.ip);
+        println!(
+            "[dhcp-server] Received DHCPRELEASE from client MAC: {}. Released lease for IP: {}.",
+            client_mac, lease.ip
+        );
     }
 }
 
@@ -205,10 +215,13 @@ async fn handle_dhcp_discover(
     leases: &mut HashMap<MacAddr, ClientLease>,
     net: ipnet::Ipv4Net,
 ) {
-    use dhcproto::{Encoder, Encodable};
-    use dhcproto::v4::{Message, DhcpOption, MessageType, Opcode};
+    use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode};
+    use dhcproto::{Encodable, Encoder};
 
-    println!("[dhcp-server] Received DHCPDISCOVER from client MAC: {}", client_mac);
+    println!(
+        "[dhcp-server] Received DHCPDISCOVER from client MAC: {}",
+        client_mac
+    );
 
     let leased_ip = match get_or_allocate_ip(client_mac, leases, net, server_ip) {
         Some(ip) => ip,
@@ -226,11 +239,17 @@ async fn handle_dhcp_discover(
     offer.set_siaddr(server_ip);
     offer.set_chaddr(dhcp.chaddr());
 
-    offer.opts_mut().insert(DhcpOption::MessageType(MessageType::Offer));
-    offer.opts_mut().insert(DhcpOption::ServerIdentifier(server_ip));
+    offer
+        .opts_mut()
+        .insert(DhcpOption::MessageType(MessageType::Offer));
+    offer
+        .opts_mut()
+        .insert(DhcpOption::ServerIdentifier(server_ip));
     offer.opts_mut().insert(DhcpOption::SubnetMask(subnet_mask));
     offer.opts_mut().insert(DhcpOption::Router(vec![server_ip]));
-    offer.opts_mut().insert(DhcpOption::DomainNameServer(vec![server_ip]));
+    offer
+        .opts_mut()
+        .insert(DhcpOption::DomainNameServer(vec![server_ip]));
     offer.opts_mut().insert(DhcpOption::AddressLeaseTime(3600));
 
     let mut offer_payload = Vec::new();
@@ -249,7 +268,10 @@ async fn handle_dhcp_discover(
     );
 
     send_raw_packet(async_sock, &offer_frame).await;
-    println!("[dhcp-server] Sent DHCPOFFER of IP: {} to client.", leased_ip);
+    println!(
+        "[dhcp-server] Sent DHCPOFFER of IP: {} to client.",
+        leased_ip
+    );
 }
 
 async fn handle_dhcp_request(
@@ -261,10 +283,13 @@ async fn handle_dhcp_request(
     client_mac: MacAddr,
     leases: &mut HashMap<MacAddr, ClientLease>,
 ) {
-    use dhcproto::{Encoder, Encodable};
-    use dhcproto::v4::{Message, DhcpOption, MessageType, OptionCode, Opcode};
+    use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode, OptionCode};
+    use dhcproto::{Encodable, Encoder};
 
-    println!("[dhcp-server] Received DHCPREQUEST from client MAC: {}", client_mac);
+    println!(
+        "[dhcp-server] Received DHCPREQUEST from client MAC: {}",
+        client_mac
+    );
 
     let requested_ip_opt = match dhcp.opts().get(OptionCode::RequestedIpAddress) {
         Some(DhcpOption::RequestedIpAddress(ip)) => Some(*ip),
@@ -279,10 +304,13 @@ async fn handle_dhcp_request(
         return;
     };
 
-    leases.insert(client_mac, ClientLease {
-        ip: leased_ip,
-        expiry: Instant::now() + Duration::from_secs(3600),
-    });
+    leases.insert(
+        client_mac,
+        ClientLease {
+            ip: leased_ip,
+            expiry: Instant::now() + Duration::from_secs(3600),
+        },
+    );
 
     let mut ack = Message::default();
     ack.set_opcode(Opcode::BootReply);
@@ -292,11 +320,14 @@ async fn handle_dhcp_request(
     ack.set_siaddr(server_ip);
     ack.set_chaddr(dhcp.chaddr());
 
-    ack.opts_mut().insert(DhcpOption::MessageType(MessageType::Ack));
-    ack.opts_mut().insert(DhcpOption::ServerIdentifier(server_ip));
+    ack.opts_mut()
+        .insert(DhcpOption::MessageType(MessageType::Ack));
+    ack.opts_mut()
+        .insert(DhcpOption::ServerIdentifier(server_ip));
     ack.opts_mut().insert(DhcpOption::SubnetMask(subnet_mask));
     ack.opts_mut().insert(DhcpOption::Router(vec![server_ip]));
-    ack.opts_mut().insert(DhcpOption::DomainNameServer(vec![server_ip]));
+    ack.opts_mut()
+        .insert(DhcpOption::DomainNameServer(vec![server_ip]));
     ack.opts_mut().insert(DhcpOption::AddressLeaseTime(3600));
 
     let mut ack_payload = Vec::new();
@@ -328,18 +359,27 @@ fn get_or_allocate_ip(
         return Some(lease.ip);
     }
 
-    let ip = net.hosts()
-        .filter(|&ip| ip != server_ip)
-        .find(|&ip| !leases.values().any(|l| l.ip == ip && l.expiry > Instant::now()))?;
+    let ip = net.hosts().filter(|&ip| ip != server_ip).find(|&ip| {
+        !leases
+            .values()
+            .any(|l| l.ip == ip && l.expiry > Instant::now())
+    })?;
 
-    leases.insert(client_mac, ClientLease {
-        ip,
-        expiry: Instant::now() + Duration::from_secs(3600),
-    });
+    leases.insert(
+        client_mac,
+        ClientLease {
+            ip,
+            expiry: Instant::now() + Duration::from_secs(3600),
+        },
+    );
     Some(ip)
 }
 
-fn get_dest_mac_ip(broadcast: bool, client_mac: MacAddr, leased_ip: Ipv4Addr) -> (MacAddr, Ipv4Addr) {
+fn get_dest_mac_ip(
+    broadcast: bool,
+    client_mac: MacAddr,
+    leased_ip: Ipv4Addr,
+) -> (MacAddr, Ipv4Addr) {
     if broadcast {
         (MacAddr::broadcast(), Ipv4Addr::BROADCAST)
     } else {
@@ -387,7 +427,7 @@ mod tests {
         let net: ipnet::Ipv4Net = "192.168.1.1/30".parse().unwrap();
         let server_ip = net.addr(); // 192.168.1.1
         let mut leases = HashMap::new();
-        
+
         let client1 = MacAddr::new(1, 2, 3, 4, 5, 6);
         let ip1 = get_or_allocate_ip(client1, &mut leases, net, server_ip);
         assert_eq!(ip1, Some(Ipv4Addr::new(192, 168, 1, 2)));

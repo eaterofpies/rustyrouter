@@ -622,7 +622,9 @@ async fn run_mock_wan_isp(
         {
             Ok(Ok(frame)) => frame,
             Ok(Err(_)) => {
-                println!("[isp-test] WAN socket connection closed. Exiting verification event loop.");
+                println!(
+                    "[isp-test] WAN socket connection closed. Exiting verification event loop."
+                );
                 break;
             }
             Err(_) => continue, // Timeout

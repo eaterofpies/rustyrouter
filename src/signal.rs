@@ -1,9 +1,9 @@
 use crate::system::SystemOps;
 use nix::sys::reboot::RebootMode;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::signal::unix::{signal, SignalKind};
-use tokio::time::{sleep, Duration};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::time::{Duration, sleep};
 
 pub async fn start_signal_monitor<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<AtomicBool>) {
     println!("[init] Starting system signal monitor...");
@@ -30,7 +30,10 @@ pub async fn start_signal_monitor<S: SystemOps>(sys: Arc<S>, shutdown_flag: Arc<
 
     println!("[init] Executing system poweroff...");
     if let Err(e) = sys.reboot(RebootMode::RB_POWER_OFF) {
-        eprintln!("[init] Poweroff failed: {}. Falling back to default reboot.", e);
+        eprintln!(
+            "[init] Poweroff failed: {}. Falling back to default reboot.",
+            e
+        );
         let _ = sys.reboot(RebootMode::RB_AUTOBOOT);
     }
 }
