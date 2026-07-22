@@ -41,16 +41,10 @@ $(INITRAMFS): $(BINARY)
 		for mod in failover net_failover virtio_net nfnetlink libcrc32c nf_defrag_ipv4 nf_defrag_ipv6 nf_tables nf_conntrack nf_nat nft_ct nft_chain_nat nft_masq; do \
 			found=$$(find "/lib/modules/$$KVER" -name "$${mod}.ko" -o -name "$${mod}.ko.zst" -o -name "$${mod}.ko.xz" -o -name "$${mod}.ko.gz" 2>/dev/null | head -n 1); \
 			if [ -n "$$found" ]; then \
-				dest="$(STAGING)/lib/modules/$$KVER/$${mod}.ko"; \
-				case "$$found" in \
-					*.zst) zstd -d -c "$$found" > "$$dest" ;; \
-					*.xz) xz -d -c "$$found" > "$$dest" ;; \
-					*.gz) gunzip -c "$$found" > "$$dest" ;; \
-					*) cp "$$found" "$$dest" ;; \
-				esac; \
-				chmod 644 "$$dest"; \
+				cp "$$found" "$(STAGING)/lib/modules/$$KVER/"; \
 			fi; \
 		done; \
+		chmod -R 644 $(STAGING)/lib/modules/$$KVER/*; \
 	fi
 	@echo "[build] Packaging initramfs into $(INITRAMFS)..."
 	@(cd $(STAGING) && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > ../initramfs.cpio.gz)

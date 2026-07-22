@@ -127,10 +127,12 @@ pub mod mock {
     use super::*;
     use std::sync::Mutex;
 
+    type MountCall = (Option<String>, String, String, MsFlags);
+
     pub struct MockSystem {
         pub pid: Pid,
         pub cmdline_content: String,
-        pub mount_calls: Mutex<Vec<(Option<String>, String, String, MsFlags)>>,
+        pub mount_calls: Mutex<Vec<MountCall>>,
         pub reboot_call: Mutex<Option<RebootMode>>,
         pub waitpid_results: Mutex<Vec<Result<WaitStatus, nix::Error>>>,
     }
@@ -245,39 +247,70 @@ mod tests {
 
 use std::path::Path;
 
-fn find_file_recursive(dir: &Path, filename: &str) -> Option<std::path::PathBuf> {
+fn find_module_recursive(dir: &Path, base_name: &str) -> Option<std::path::PathBuf> {
     let entries = fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
-        if let Some(found) = check_path(&path, filename) {
+        if path.is_dir()
+            && let Some(found) = find_module_recursive(&path, base_name)
+        {
             return Some(found);
         }
-    }
-    None
-}
-
-fn check_path(path: &Path, filename: &str) -> Option<std::path::PathBuf> {
-    if path.is_dir() {
-        return find_file_recursive(path, filename);
-    }
-    if path.file_name() == Some(std::ffi::OsStr::new(filename)) {
-        return Some(path.to_path_buf());
+        if !path.is_dir()
+            && let Some(file_name_str) = path.file_name().and_then(|n| n.to_str())
+            && (file_name_str == base_name
+                || file_name_str == format!("{}.xz", base_name)
+                || file_name_str == format!("{}.gz", base_name)
+                || file_name_str == format!("{}.zst", base_name))
+        {
+            return Some(path);
+        }
     }
     None
 }
 
 fn find_module_file(name: &str) -> Option<std::path::PathBuf> {
     let modules_dir = Path::new("/lib/modules");
-    let filename = format!("{}.ko", name);
-    find_file_recursive(modules_dir, &filename)
+    let base_name = format!("{}.ko", name);
+    find_module_recursive(modules_dir, &base_name)
+}
+
+fn decompress_module(data: &[u8], path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    match extension {
+        "xz" => {
+            let mut decompressed = Vec::new();
+            let mut cursor = std::io::Cursor::new(data);
+            lzma_rs::xz_decompress(&mut cursor, &mut decompressed)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            Ok(decompressed)
+        }
+        "gz" => {
+            use std::io::Read;
+            let mut decompressed = Vec::new();
+            let mut decoder = flate2::read::GzDecoder::new(data);
+            decoder.read_to_end(&mut decompressed)?;
+            Ok(decompressed)
+        }
+        "zst" => {
+            let mut decompressed = Vec::new();
+            let mut decoder = ruzstd::decoding::FrameDecoder::new();
+            decoder
+                .decode_all_to_vec(data, &mut decompressed)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            Ok(decompressed)
+        }
+        _ => Ok(data.to_vec()),
+    }
 }
 
 fn load_module(path: &Path) -> Result<(), std::io::Error> {
     println!("[init] Loading kernel module: {:?}", path);
-    let file = fs::File::open(path)?;
+    let raw_data = fs::read(path)?;
+    let decompressed_data = decompress_module(&raw_data, path)?;
 
     let param = std::ffi::CString::new("").unwrap();
-    if let Err(e) = nix::kmod::finit_module(&file, &param, nix::kmod::ModuleInitFlags::empty())
+    if let Err(e) = nix::kmod::init_module(&decompressed_data, &param)
         && e != nix::errno::Errno::EEXIST
     {
         return Err(std::io::Error::other(e.to_string()));
