@@ -274,7 +274,7 @@ impl DhcpClient {
         &self,
         xid: u32,
         timeout: std::time::Duration,
-    ) -> Result<Option<DhcpOffer>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<DhcpOffer>, std::io::Error> {
         let start = std::time::Instant::now();
         let mut buf = [0u8; 2048];
 
@@ -299,7 +299,7 @@ impl DhcpClient {
         &self,
         xid: u32,
         timeout: std::time::Duration,
-    ) -> Result<Option<ParseAckResult>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<ParseAckResult>, std::io::Error> {
         let start = std::time::Instant::now();
         let mut buf = [0u8; 2048];
 
@@ -325,13 +325,13 @@ impl DhcpClient {
         &self,
         buf: &mut [u8],
         timeout: std::time::Duration,
-    ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
-        let read_res = tokio::time::timeout(timeout, self.socket.recv_from(buf)).await;
-        match read_res {
-            Ok(Ok((n, _src))) => Ok(Some(n)),
-            Ok(Err(e)) => Err(e.into()),
-            Err(_) => Ok(None), // Timeout
-        }
+    ) -> Result<Option<usize>, std::io::Error> {
+        let Ok(recv_res) = tokio::time::timeout(timeout, self.socket.recv_from(buf)).await else {
+            return Ok(None); // Timeout occurred
+        };
+
+        let (n, _src) = recv_res?;
+        Ok(Some(n))
     }
 
     async fn send_dhcp_message(
@@ -390,15 +390,14 @@ impl DhcpClient {
             (ip, mask)
         };
 
-        if let Some(ip) = ip {
-            if let Some(mask) = mask {
-                if let Err(e) = deconfigure_wan(&self.wan_interface, ip, mask).await {
-                    println!(
-                        "[dhcp-client] ERROR: Failed to deconfigure WAN interface via netlink: {}",
-                        e
-                    );
-                }
-            }
+        if let Some(ip) = ip
+            && let Some(mask) = mask
+            && let Err(e) = deconfigure_wan(&self.wan_interface, ip, mask).await
+        {
+            println!(
+                "[dhcp-client] ERROR: Failed to deconfigure WAN interface via netlink: {}",
+                e
+            );
         }
     }
 
@@ -620,10 +619,8 @@ async fn deconfigure_wan(
                     break;
                 }
             }
-            if matches_ip {
-                if let Err(e) = handle.address().del(addr).execute().await {
-                    println!("[dhcp-client] WARNING: Failed to delete IP address: {}", e);
-                }
+            if matches_ip && let Err(e) = handle.address().del(addr).execute().await {
+                println!("[dhcp-client] WARNING: Failed to delete IP address: {}", e);
             }
         }
     }
