@@ -9,11 +9,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
     bash \
+    clang \
     cpio \
     curl \
     ca-certificates \
     git \
     less \
+    libclang-dev \
     linux-image-cloud-amd64 \
     make \
     qemu-system-x86 \
