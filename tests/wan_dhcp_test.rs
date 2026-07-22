@@ -1,6 +1,7 @@
 #![allow(dead_code, unused_macros)]
 
 use dhcproto::Decodable;
+use futures_util::FutureExt;
 use pnet::packet::Packet;
 use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
@@ -129,7 +130,7 @@ struct TestEnv {
 }
 
 macro_rules! run_step {
-    ($name:expr, $future:expr, $passed:ident, $failed:ident) => {
+    ($name:expr, $future:expr, $passed:expr, $failed:expr) => {
         std::print!("test {} ... ", $name);
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
         let start = std::time::Instant::now();
@@ -149,16 +150,31 @@ macro_rules! run_step {
                 } else {
                     std::println!("\nstep {} panicked with unknown error\n", $name);
                 }
-                break;
+                return;
             }
         }
     };
 }
 
+async fn run_all_steps(env: &mut TestEnv, passed: &mut usize, failed: &mut usize) {
+    run_step!(
+        "wan_and_lan_dhcp",
+        verify_wan_and_lan_dhcp(env),
+        *passed,
+        *failed
+    );
+    run_step!("nat_routing", verify_nat_routing(env), *passed, *failed);
+    run_step!(
+        "dns_forwarding",
+        verify_dns_forwarding(env),
+        *passed,
+        *failed
+    );
+    run_step!("dhcp_renewal", verify_dhcp_renewal(env), *passed, *failed);
+}
+
 #[tokio::main]
 async fn main() {
-    use futures_util::FutureExt;
-
     std::println!("\nrunning 4 test steps");
     let mut env = startup_stage().await;
 
@@ -167,28 +183,7 @@ async fn main() {
 
     let start_time = std::time::Instant::now();
 
-    loop {
-        run_step!(
-            "wan_and_lan_dhcp",
-            verify_wan_and_lan_dhcp(&env),
-            passed,
-            failed
-        );
-        run_step!("nat_routing", verify_nat_routing(&mut env), passed, failed);
-        run_step!(
-            "dns_forwarding",
-            verify_dns_forwarding(&mut env),
-            passed,
-            failed
-        );
-        run_step!(
-            "dhcp_renewal",
-            verify_dhcp_renewal(&mut env),
-            passed,
-            failed
-        );
-        break;
-    }
+    run_all_steps(&mut env, &mut passed, &mut failed).await;
 
     // Tear down VM cleanly
     std::println!("\n=== Cleaning up QEMU VM... ===");
