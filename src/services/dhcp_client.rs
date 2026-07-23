@@ -10,6 +10,42 @@ const DEFAULT_LEASE_SECS: u32 = 3600;
 const MAX_RETRY_DELAY_SECS: u32 = 64;
 const INITIAL_RETRY_DELAY_SECS: u32 = 4;
 const DEFAULT_SUBNET_MASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
+const SOCKET_RESTART_DELAY_SECS: u64 = 5;
+
+#[derive(Debug)]
+enum DhcpError {
+    Io(std::io::Error),
+    Protocol(String),
+    Nak,
+    InterfaceNotFound(String),
+    RtNetlink(rtnetlink::Error),
+}
+
+impl std::fmt::Display for DhcpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DhcpError::Io(e) => write!(f, "IO error: {}", e),
+            DhcpError::Protocol(s) => write!(f, "DHCP protocol error: {}", s),
+            DhcpError::Nak => write!(f, "DHCPNAK received"),
+            DhcpError::InterfaceNotFound(iface) => write!(f, "Interface not found: {}", iface),
+            DhcpError::RtNetlink(e) => write!(f, "Netlink error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for DhcpError {}
+
+impl From<std::io::Error> for DhcpError {
+    fn from(e: std::io::Error) -> Self {
+        DhcpError::Io(e)
+    }
+}
+
+impl From<rtnetlink::Error> for DhcpError {
+    fn from(e: rtnetlink::Error) -> Self {
+        DhcpError::RtNetlink(e)
+    }
+}
 
 struct DhcpOffer {
     offered_ip: Ipv4Addr,
@@ -23,6 +59,13 @@ struct DhcpAck {
     server_ip: Option<Ipv4Addr>,
     lease_secs: u32,
     dns_servers: Vec<Ipv4Addr>,
+}
+
+struct LeaseOptions {
+    mask: Ipv4Addr,
+    gateway: Option<Ipv4Addr>,
+    dns_servers: Vec<Ipv4Addr>,
+    lease_secs: u32,
 }
 
 enum ParseAckResult {
@@ -60,11 +103,12 @@ impl DhcpClient {
                 Ok(res) => res,
                 Err(e) => {
                     println!(
-                        "[dhcp-client] Discover phase failed: {}. Retrying in 5s...",
-                        e
+                        "[dhcp-client] Discover phase failed: {}. Retrying in {}s...",
+                        e, SOCKET_RESTART_DELAY_SECS
                     );
                     self.deconfigure().await;
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS))
+                        .await;
                     continue;
                 }
             };
@@ -74,11 +118,12 @@ impl DhcpClient {
                 Ok(res) => res,
                 Err(e) => {
                     println!(
-                        "[dhcp-client] Request phase failed: {}. Restarting negotiation in 5s...",
-                        e
+                        "[dhcp-client] Request phase failed: {}. Restarting negotiation in {}s...",
+                        e, SOCKET_RESTART_DELAY_SECS
                     );
                     self.deconfigure().await;
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS))
+                        .await;
                     continue;
                 }
             };
@@ -93,9 +138,7 @@ impl DhcpClient {
         }
     }
 
-    async fn discover_phase(
-        &self,
-    ) -> Result<(u32, DhcpOffer), Box<dyn std::error::Error + Send + Sync>> {
+    async fn discover_phase(&self) -> Result<(u32, DhcpOffer), DhcpError> {
         let xid = rand::random::<u32>();
         let mut retry_delay_secs = INITIAL_RETRY_DELAY_SECS;
 
@@ -115,11 +158,7 @@ impl DhcpClient {
         }
     }
 
-    async fn request_phase(
-        &self,
-        xid: u32,
-        offer: DhcpOffer,
-    ) -> Result<DhcpAck, Box<dyn std::error::Error + Send + Sync>> {
+    async fn request_phase(&self, xid: u32, offer: DhcpOffer) -> Result<DhcpAck, DhcpError> {
         let mut retry_delay_secs = INITIAL_RETRY_DELAY_SECS;
 
         loop {
@@ -141,7 +180,7 @@ impl DhcpClient {
                     }
                     ParseAckResult::Nak => {
                         println!("[dhcp-client] Received DHCPNAK!");
-                        return Err("DHCPNAK received".into());
+                        return Err(DhcpError::Nak);
                     }
                     ParseAckResult::None => {}
                 }
@@ -151,31 +190,21 @@ impl DhcpClient {
         }
     }
 
-    async fn bound_phase(
-        &self,
-        ack: DhcpAck,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut ip = ack.ip;
-        let mut mask = ack.mask;
-        let mut gateway = ack.gateway;
-        let mut dns_servers = ack.dns_servers;
-        let mut lease_secs = ack.lease_secs;
-        let mut server_ip = ack.server_ip;
-
-        self.apply_lease_config(ip, mask, gateway, &dns_servers)
+    async fn bound_phase(&self, mut ack: DhcpAck) -> Result<(), DhcpError> {
+        self.apply_lease_config(ack.ip, ack.mask, ack.gateway, &ack.dns_servers)
             .await?;
         let mut bound_at = std::time::Instant::now();
 
         loop {
             let elapsed = bound_at.elapsed().as_secs() as u32;
-            if elapsed >= lease_secs {
+            if elapsed >= ack.lease_secs {
                 println!("[dhcp-client] Lease expired!");
                 self.deconfigure().await;
-                return Err("Lease expired".into());
+                return Err(DhcpError::Protocol("Lease expired".to_string()));
             }
 
             // T1 Renewal time is lease_secs / 2
-            let t1_secs = lease_secs / 2;
+            let t1_secs = ack.lease_secs / 2;
             if elapsed < t1_secs {
                 let sleep_duration = std::time::Duration::from_secs((t1_secs - elapsed) as u64);
                 tokio::time::sleep(sleep_duration).await;
@@ -183,22 +212,16 @@ impl DhcpClient {
             }
 
             // T2 Rebinding time is 87.5% of lease (RFC 2131 section 4.4.5)
-            let t2_secs = (lease_secs as f64 * 0.875) as u32;
+            let t2_secs = (ack.lease_secs as f64 * 0.875) as u32;
 
             // Perform lease renewal phase
             match self
-                .renew_lease(ip, t2_secs, lease_secs, server_ip, bound_at)
+                .renew_lease(ack.ip, t2_secs, ack.lease_secs, ack.server_ip, bound_at)
                 .await
             {
                 Ok(new_ack) => {
-                    ip = new_ack.ip;
-                    mask = new_ack.mask;
-                    gateway = new_ack.gateway;
-                    dns_servers = new_ack.dns_servers;
-                    lease_secs = new_ack.lease_secs;
-                    server_ip = new_ack.server_ip;
-
-                    self.apply_lease_config(ip, mask, gateway, &dns_servers)
+                    ack = new_ack;
+                    self.apply_lease_config(ack.ip, ack.mask, ack.gateway, &ack.dns_servers)
                         .await?;
                     bound_at = std::time::Instant::now();
                 }
@@ -217,26 +240,20 @@ impl DhcpClient {
         lease_secs: u32,
         server_ip: Option<Ipv4Addr>,
         bound_at: std::time::Instant,
-    ) -> Result<DhcpAck, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<DhcpAck, DhcpError> {
         let renew_xid = rand::random::<u32>();
         let mut renew_sent: Option<std::time::Instant> = None;
 
         loop {
             let current_elapsed = bound_at.elapsed().as_secs() as u32;
             if current_elapsed >= lease_secs {
-                return Err("Lease expired during renewal".into());
+                return Err(DhcpError::Protocol(
+                    "Lease expired during renewal".to_string(),
+                ));
             }
 
-            let in_rebinding = current_elapsed >= t2_secs;
-            let (retry_interval, dest_ip) = if in_rebinding {
-                let remaining = lease_secs.saturating_sub(current_elapsed);
-                let interval = std::cmp::max(remaining / 2, 60);
-                (interval, Ipv4Addr::BROADCAST)
-            } else {
-                let remaining = t2_secs.saturating_sub(current_elapsed);
-                let interval = std::cmp::max(remaining / 2, 60);
-                (interval, server_ip.unwrap_or(Ipv4Addr::BROADCAST))
-            };
+            let (retry_interval, dest_ip, in_rebinding) =
+                calculate_renewal_params(current_elapsed, t2_secs, lease_secs, server_ip);
 
             let should_send = match renew_sent {
                 None => true,
@@ -262,7 +279,7 @@ impl DhcpClient {
                     }
                     ParseAckResult::Nak => {
                         println!("[dhcp-client] Renewal NAK'd!");
-                        return Err("Lease renewal NAK'd".into());
+                        return Err(DhcpError::Nak);
                     }
                     ParseAckResult::None => {}
                 }
@@ -274,7 +291,7 @@ impl DhcpClient {
         &self,
         xid: u32,
         timeout: std::time::Duration,
-    ) -> Result<Option<DhcpOffer>, std::io::Error> {
+    ) -> Result<Option<DhcpOffer>, DhcpError> {
         let start = std::time::Instant::now();
         let mut buf = [0u8; 2048];
 
@@ -299,7 +316,7 @@ impl DhcpClient {
         &self,
         xid: u32,
         timeout: std::time::Duration,
-    ) -> Result<Option<ParseAckResult>, std::io::Error> {
+    ) -> Result<Option<ParseAckResult>, DhcpError> {
         let start = std::time::Instant::now();
         let mut buf = [0u8; 2048];
 
@@ -325,7 +342,7 @@ impl DhcpClient {
         &self,
         buf: &mut [u8],
         timeout: std::time::Duration,
-    ) -> Result<Option<usize>, std::io::Error> {
+    ) -> Result<Option<usize>, DhcpError> {
         let Ok(recv_res) = tokio::time::timeout(timeout, self.socket.recv_from(buf)).await else {
             return Ok(None); // Timeout occurred
         };
@@ -338,10 +355,12 @@ impl DhcpClient {
         &self,
         message: dhcproto::v4::Message,
         dest_ip: Ipv4Addr,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), DhcpError> {
         use dhcproto::{Encodable, Encoder};
         let mut payload = Vec::new();
-        message.encode(&mut Encoder::new(&mut payload))?;
+        message
+            .encode(&mut Encoder::new(&mut payload))
+            .map_err(|e| DhcpError::Protocol(e.to_string()))?;
 
         let dest_addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
             dest_ip,
@@ -357,7 +376,7 @@ impl DhcpClient {
         mask: Ipv4Addr,
         gateway: Option<Ipv4Addr>,
         dns_servers: &[Ipv4Addr],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), DhcpError> {
         let changed = {
             let mut lease = self.lease_state.lock().unwrap();
             let changed = lease.ip != Some(ip)
@@ -499,18 +518,21 @@ pub async fn start_dhcp_client(wan_interface: String, lease_state: SharedWanLeas
             Ok(s) => s,
             Err(e) => {
                 eprintln!(
-                    "[dhcp-client] ERROR: Failed to create client socket: {}. Retrying in 5s...",
-                    e
+                    "[dhcp-client] ERROR: Failed to create client socket: {}. Retrying in {}s...",
+                    e, SOCKET_RESTART_DELAY_SECS
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS)).await;
                 continue;
             }
         };
 
         let client = DhcpClient::new(socket, mac, lease_state.clone(), wan_interface.clone());
         client.run().await;
-        println!("[dhcp-client] Socket closed or client loop exited. Restarting in 5s...");
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        println!(
+            "[dhcp-client] Socket closed or client loop exited. Restarting in {}s...",
+            SOCKET_RESTART_DELAY_SECS
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(SOCKET_RESTART_DELAY_SECS)).await;
     }
 }
 
@@ -530,6 +552,39 @@ fn get_jittered_duration(base_secs: u32) -> std::time::Duration {
         std::time::Duration::from_secs(1),
         std::time::Duration::from_secs_f64(secs),
     )
+}
+
+fn mask_to_prefix_len(mask: Ipv4Addr) -> Result<u8, DhcpError> {
+    let mask_u32 = u32::from(mask);
+    let leading_ones = mask_u32.leading_ones();
+    let trailing_zeros = mask_u32.trailing_zeros();
+
+    if leading_ones + trailing_zeros != 32 {
+        return Err(DhcpError::Protocol(format!(
+            "Invalid non-contiguous subnet mask: {}",
+            mask
+        )));
+    }
+    Ok(leading_ones as u8)
+}
+
+fn calculate_renewal_params(
+    current_elapsed: u32,
+    t2_secs: u32,
+    lease_secs: u32,
+    server_ip: Option<Ipv4Addr>,
+) -> (u32, Ipv4Addr, bool) {
+    let in_rebinding = current_elapsed >= t2_secs;
+    let (retry_interval, dest_ip) = if in_rebinding {
+        let remaining = lease_secs.saturating_sub(current_elapsed);
+        let interval = std::cmp::max(remaining / 2, 60);
+        (interval, Ipv4Addr::BROADCAST)
+    } else {
+        let remaining = t2_secs.saturating_sub(current_elapsed);
+        let interval = std::cmp::max(remaining / 2, 60);
+        (interval, server_ip.unwrap_or(Ipv4Addr::BROADCAST))
+    };
+    (retry_interval, dest_ip, in_rebinding)
 }
 
 fn parse_offer(buf: &[u8], xid: u32) -> Option<DhcpOffer> {
@@ -566,14 +621,14 @@ fn parse_ack_nak(buf: &[u8], xid: u32) -> ParseAckResult {
     }
     match dhcp.opts().get(OptionCode::MessageType) {
         Some(DhcpOption::MessageType(MessageType::Ack)) => {
-            let (mask, gateway, dns_servers, lease_secs) = parse_lease_options(&dhcp);
+            let opts = parse_lease_options(&dhcp);
             ParseAckResult::Ack(DhcpAck {
                 ip: dhcp.yiaddr(),
-                mask,
-                gateway,
+                mask: opts.mask,
+                gateway: opts.gateway,
                 server_ip: get_server_identifier(&dhcp),
-                lease_secs,
-                dns_servers,
+                lease_secs: opts.lease_secs,
+                dns_servers: opts.dns_servers,
             })
         }
         Some(DhcpOption::MessageType(MessageType::Nak)) => ParseAckResult::Nak,
@@ -585,8 +640,8 @@ async fn deconfigure_wan(
     wan_interface: &str,
     ip: Ipv4Addr,
     mask: Ipv4Addr,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let prefix_len = mask.octets().iter().map(|&x| x.count_ones()).sum::<u32>() as u8;
+) -> Result<(), DhcpError> {
+    let prefix_len = mask_to_prefix_len(mask)?;
     println!(
         "[dhcp-client] Deconfiguring WAN interface via netlink: removing IP {}/{}",
         ip, prefix_len
@@ -602,7 +657,7 @@ async fn deconfigure_wan(
         .execute();
     let link = match links.try_next().await? {
         Some(l) => l,
-        None => return Err(format!("Interface {} not found", wan_interface).into()),
+        None => return Err(DhcpError::InterfaceNotFound(wan_interface.to_string())),
     };
     let index = link.header.index;
 
@@ -632,8 +687,8 @@ async fn configure_wan(
     ip: Ipv4Addr,
     mask: Ipv4Addr,
     gateway: Option<Ipv4Addr>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let prefix_len = mask.octets().iter().map(|&x| x.count_ones()).sum::<u32>() as u8;
+) -> Result<(), DhcpError> {
+    let prefix_len = mask_to_prefix_len(mask)?;
     println!(
         "[dhcp-client] Configuring WAN interface via netlink: IP={}/{}, Gateway={:?}",
         ip, prefix_len, gateway
@@ -649,15 +704,20 @@ async fn configure_wan(
         .execute();
     let link = match links.try_next().await? {
         Some(l) => l,
-        None => return Err(format!("Interface {} not found", wan_interface).into()),
+        None => return Err(DhcpError::InterfaceNotFound(wan_interface.to_string())),
     };
     let index = link.header.index;
 
     // Flush existing addresses on WAN first
     let mut addresses = handle.address().get().execute();
     while let Some(addr) = addresses.try_next().await? {
-        if addr.header.index == index {
-            let _ = handle.address().del(addr).execute().await;
+        if addr.header.index == index
+            && let Err(e) = handle.address().del(addr).execute().await
+        {
+            println!(
+                "[dhcp-client] WARNING: Failed to delete existing address: {}",
+                e
+            );
         }
     }
 
@@ -694,9 +754,7 @@ fn get_server_identifier(dhcp: &dhcproto::v4::Message) -> Option<Ipv4Addr> {
     }
 }
 
-fn parse_lease_options(
-    dhcp: &dhcproto::v4::Message,
-) -> (Ipv4Addr, Option<Ipv4Addr>, Vec<Ipv4Addr>, u32) {
+fn parse_lease_options(dhcp: &dhcproto::v4::Message) -> LeaseOptions {
     use dhcproto::v4::DhcpOption;
     use dhcproto::v4::OptionCode;
 
@@ -720,7 +778,12 @@ fn parse_lease_options(
         _ => DEFAULT_LEASE_SECS,
     };
 
-    (mask, gateway, dns, lease_secs)
+    LeaseOptions {
+        mask,
+        gateway,
+        dns_servers: dns,
+        lease_secs,
+    }
 }
 
 fn make_client_socket(interface_name: &str) -> std::io::Result<UdpSocket> {
@@ -858,10 +921,29 @@ mod tests {
         msg.opts_mut()
             .insert(DhcpOption::MessageType(MessageType::Ack));
 
-        let (mask, gateway, dns, lease_secs) = parse_lease_options(&msg);
-        assert_eq!(mask, DEFAULT_MASK);
-        assert_eq!(gateway, None);
-        assert!(dns.is_empty());
-        assert_eq!(lease_secs, DEFAULT_LEASE_SECS);
+        let opts = parse_lease_options(&msg);
+        assert_eq!(opts.mask, DEFAULT_MASK);
+        assert_eq!(opts.gateway, None);
+        assert!(opts.dns_servers.is_empty());
+        assert_eq!(opts.lease_secs, DEFAULT_LEASE_SECS);
+    }
+
+    #[test]
+    fn test_mask_to_prefix_len_valid() {
+        assert_eq!(
+            mask_to_prefix_len(Ipv4Addr::new(255, 255, 255, 0)).unwrap(),
+            24
+        );
+        assert_eq!(
+            mask_to_prefix_len(Ipv4Addr::new(255, 255, 255, 255)).unwrap(),
+            32
+        );
+        assert_eq!(mask_to_prefix_len(Ipv4Addr::new(0, 0, 0, 0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_mask_to_prefix_len_invalid() {
+        assert!(mask_to_prefix_len(Ipv4Addr::new(255, 255, 255, 10)).is_err());
+        assert!(mask_to_prefix_len(Ipv4Addr::new(255, 0, 255, 0)).is_err());
     }
 }
