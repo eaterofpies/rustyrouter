@@ -121,7 +121,10 @@ async fn run_server_loop(
     loop {
         let bytes_read = match read_raw_packet(async_sock, &mut buf).await {
             Ok(n) => n,
-            Err(_) => break, // Socket error, recreate socket
+            Err(e) => {
+                eprintln!("[dhcp-server] Socket read error: {}. Recreating socket.", e);
+                break;
+            }
         };
 
         process_incoming_packet(bytes_read, &buf, async_sock, config, leases).await;
