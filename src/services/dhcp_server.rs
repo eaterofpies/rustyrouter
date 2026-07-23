@@ -189,12 +189,17 @@ pub async fn start_dhcp_server(lan_interface: String, lan_ip: String) {
     let server_ip = net.addr();
     let subnet_mask = net.netmask();
 
-    let start_ip = Ipv4Addr::from(u32::from(net.network()) + 1);
-    let end_ip = Ipv4Addr::from(u32::from(net.broadcast()) - 1);
-    println!(
-        "[dhcp-server] Dynamic lease pool: {} to {}",
-        start_ip, end_ip
-    );
+    let mut hosts = net.hosts();
+    let start_ip = hosts.next();
+    let end_ip = hosts.next_back();
+    if let (Some(start), Some(end)) = (start_ip, end_ip) {
+        println!(
+            "[dhcp-server] Dynamic lease pool: {} to {}",
+            start, end
+        );
+    } else {
+        println!("[dhcp-server] Dynamic lease pool: (empty)");
+    }
 
     let mut leases = LeaseTable::new();
 
