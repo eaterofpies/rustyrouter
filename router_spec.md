@@ -118,18 +118,15 @@ All services are implemented directly inside the `rustyrouter` binary using asyn
 2. **DHCP Server (LAN)**:
    - Listens for client discovery packets on port 67 of the LAN interface.
    - Uses raw packet sockets (`AF_PACKET`) to unicast DHCP replies directly to the client's MAC address (since the client does not yet have an IP address and cannot respond to ARP).
-   - Manages an in-memory database of active leases.
+   - **Lease Integrity & Eviction**: Manages an in-memory database of active leases using a synchronized `LeaseTable` module to ensure the lease map and IP allocation index remain aligned. Evicts expired leases automatically to reclaim IPs.
+   - **Address Validation**: Rejects client requests that fall outside the LAN subnet, match the server's own IP, or conflict with another active lease (returns `DHCPNAK` on conflicts).
    - Hands out IPs to LAN clients, advertising `rustyrouter`'s LAN IP as the gateway and DNS resolver.
 3. **DNS Forwarder**:
    - Listens on port 53 (UDP) on the LAN interface.
    - By default, forwards client DNS queries to the DNS server IPs dynamically obtained from the WAN interface's DHCP lease.
    - If no DNS servers are provided in the WAN DHCP lease, falls back to the static DNS servers specified on the kernel command line or a compile-time default (e.g., `8.8.8.8`).
-   - Maintains a small, in-memory DNS cache.
+   - **Cache Poisoning & Ephemeral Port Exhaustion Protections**: Uses a single, long-lived client UDP socket for all upstream queries instead of binding temporary ephemeral sockets per request. Generates unique, randomized transaction IDs and checks replies to match, fully rejecting spoofed packets with mismatched upstream source IPs to prevent Kaminsky-style cache poisoning.
    - **UDP Only**: Only UDP DNS proxying is supported. TCP DNS queries (including DNSSEC fallback) are unsupported.
-4. **NTP Client**:
-   - Query upstream NTP servers (like `pool.ntp.org` or `time.google.com`) using SNTP (Simple Network Time Protocol) on UDP port 123.
-   - Update the system clock using standard clock-setting system calls (`clock_settime` via the `nix` crate).
-   - Periodically synchronize time (e.g. on startup after WAN IP is obtained, and then periodically).
 
 ### 2.4 Logging & Timestamps
 - All standard output and error logs printed by `rustyrouter` must include a standardized timestamp prefix with millisecond resolution.
