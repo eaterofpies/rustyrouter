@@ -127,6 +127,11 @@ All services are implemented directly inside the `rustyrouter` binary using asyn
    - If no DNS servers are provided in the WAN DHCP lease, falls back to the static DNS servers specified on the kernel command line or a compile-time default (e.g., `8.8.8.8`).
    - **Cache Poisoning & Ephemeral Port Exhaustion Protections**: Uses a single, long-lived client UDP socket for all upstream queries instead of binding temporary ephemeral sockets per request. Generates unique, randomized transaction IDs and checks replies to match, fully rejecting spoofed packets with mismatched upstream source IPs to prevent Kaminsky-style cache poisoning.
    - **UDP Only**: Only UDP DNS proxying is supported. TCP DNS queries (including DNSSEC fallback) are unsupported.
+4. **NTP Client (SNTP)**:
+   - Synchronizes router system time periodically using SNTP (Simple Network Time Protocol) on UDP port 123 from `pool.ntp.org`.
+   - Starts sync loop automatically after a WAN IP and DNS servers are acquired from the DHCP lease.
+   - Updates the system clock using standard clock-setting system calls (`clock_settime` via the `nix` crate).
+   - Retries with backoff on network failures and performs sync checks every 30 minutes.
 
 ### 2.4 Logging & Timestamps
 - All standard output and error logs printed by `rustyrouter` must include a standardized timestamp prefix with millisecond resolution.

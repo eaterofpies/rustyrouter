@@ -172,6 +172,12 @@ async fn main() {
         services::start_dns_forwarder(dns_lease).await;
     });
 
+    // Spawn SNTP Client
+    let sntp_lease = lease_state.clone();
+    tokio::spawn(async move {
+        services::start_sntp_client(sntp_lease).await;
+    });
+
     println!("[init] System startup completed successfully. Entering main event loop.");
 
     // Keep the main thread alive waiting for the signal handler to finish

@@ -207,3 +207,73 @@ pub fn get_timestamp_prefix() -> String {
     let now = chrono::Utc::now();
     now.format("[%Y-%m-%dT%H:%M:%S%.3fZ] ").to_string()
 }
+
+const LOCALHOST: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
+const DNS_PORT: u16 = 53;
+const LOCAL_DNS_BIND: &str = "127.0.0.1:0";
+
+pub async fn resolve_dns_a_record(host: &str) -> Result<std::net::Ipv4Addr, String> {
+    use tokio::net::UdpSocket;
+    use tokio::time::timeout;
+
+    let socket = UdpSocket::bind(LOCAL_DNS_BIND)
+        .await
+        .map_err(|e| format!("Failed to bind DNS query socket: {}", e))?;
+
+    // Generate unique randomized transaction ID
+    let query_id = rand::random::<u16>();
+
+    // Build DNS standard query for the host (A record)
+    let mut builder = dns_parser::Builder::new_query(query_id, true);
+    builder.add_question(
+        host,
+        false,
+        dns_parser::QueryType::A,
+        dns_parser::QueryClass::IN,
+    );
+    let query = builder
+        .build()
+        .map_err(|_| "Failed to build DNS query packet".to_string())?;
+
+    let dns_server = std::net::SocketAddr::new(std::net::IpAddr::V4(LOCALHOST), DNS_PORT);
+
+    socket
+        .send_to(&query, dns_server)
+        .await
+        .map_err(|e| format!("Failed to send DNS query: {}", e))?;
+
+    let mut buf = [0u8; 512];
+    let recv_res = timeout(
+        std::time::Duration::from_secs(3),
+        socket.recv_from(&mut buf),
+    )
+    .await;
+    let (len, _) = match recv_res {
+        Ok(Ok((l, addr))) => {
+            if addr == dns_server {
+                (l, addr)
+            } else {
+                return Err("Received packet from unexpected source".to_string());
+            }
+        }
+        Ok(Err(e)) => return Err(format!("Socket receive error: {}", e)),
+        Err(_) => return Err("DNS query timed out".to_string()),
+    };
+
+    let packet = dns_parser::Packet::parse(&buf[..len])
+        .map_err(|e| format!("Failed to parse DNS response: {}", e))?;
+
+    if packet.header.id != query_id {
+        return Err("Transaction ID mismatch".to_string());
+    }
+
+    let mut resolved_ip = None;
+    for answer in packet.answers {
+        if let dns_parser::RData::A(ip) = answer.data {
+            resolved_ip = Some(ip.0);
+            break;
+        }
+    }
+
+    resolved_ip.ok_or_else(|| format!("No A record resolved for {}", host))
+}

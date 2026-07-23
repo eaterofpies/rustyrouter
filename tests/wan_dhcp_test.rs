@@ -177,6 +177,7 @@ async fn run_all_steps(env: &mut TestEnv, passed: &mut usize, failed: &mut usize
         *passed,
         *failed
     );
+    run_step!("sntp_sync", verify_sntp_sync(env), *passed, *failed);
     run_step!("dhcp_renewal", verify_dhcp_renewal(env), *passed, *failed);
 }
 
@@ -255,19 +256,19 @@ async fn startup_stage() -> TestEnv {
     } else {
         "".to_string()
     };
-    if kernel.is_empty() {
-        if let Ok(entries) = std::fs::read_dir("/boot") {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    let name = path.file_name().unwrap().to_string_lossy();
-                    if name.starts_with("vmlinuz-")
-                        && !name.contains("rescue")
-                        && !name.contains("fallback")
-                    {
-                        kernel = path.to_string_lossy().into_owned();
-                        break;
-                    }
+    if kernel.is_empty()
+        && let Ok(entries) = std::fs::read_dir("/boot")
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let name = path.file_name().unwrap().to_string_lossy();
+                if name.starts_with("vmlinuz-")
+                    && !name.contains("rescue")
+                    && !name.contains("fallback")
+                {
+                    kernel = path.to_string_lossy().into_owned();
+                    break;
                 }
             }
         }
@@ -537,7 +538,7 @@ async fn verify_dns_forwarding(env: &mut TestEnv) {
         if let Ok(Ok(frame)) =
             tokio::time::timeout(Duration::from_millis(100), env.lan_client.recv_frame()).await
             && let Some((_src_ip, _dest_ip, src_port, dest_port, payload)) =
-                parse_dns_request(&frame).ok().flatten()
+                parse_udp_packet(&frame).ok().flatten()
             && src_port == 53
             && dest_port == 12345
             && payload == DNS_RESPONSE
@@ -570,6 +571,28 @@ async fn verify_dns_forwarding(env: &mut TestEnv) {
         "WAN mock server did not verify forwarded DNS query"
     );
     println!("[test] DNS UDP forwarding verified successfully.");
+}
+
+async fn verify_sntp_sync(env: &mut TestEnv) {
+    println!("[test] Awaiting NTP time synchronization...");
+    let mut ntp_verified = false;
+    let start_wan = std::time::Instant::now();
+    while start_wan.elapsed() < Duration::from_secs(20) {
+        tokio::select! {
+            Some(msg) = env.wan_verification_rx.recv() => {
+                if msg == "NTP_VERIFIED" {
+                    ntp_verified = true;
+                    break;
+                }
+            }
+            _ = sleep(Duration::from_millis(50)) => {}
+        }
+    }
+    assert!(
+        ntp_verified,
+        "NTP synchronization request was not verified on the WAN interface"
+    );
+    println!("[test] NTP time synchronization verified successfully.");
 }
 
 async fn verify_dhcp_renewal(env: &mut TestEnv) {
@@ -762,7 +785,7 @@ async fn run_mock_wan_isp(
 
         // C. Handle DNS request to 10.0.2.3:53 (checks DNS forwarding)
         if let Some((src_ip, dest_ip, src_port, dest_port, payload)) =
-            parse_dns_request(&frame).ok().flatten()
+            parse_udp_packet(&frame).ok().flatten()
             && dest_ip == MOCK_DNS_SERVER
             && dest_port == 53
         {
@@ -794,6 +817,54 @@ async fn run_mock_wan_isp(
                 &response_payload,
             );
             let _ = mock.send_frame(&dns_reply).await;
+            continue;
+        }
+
+        // E. Handle NTP request to 10.0.2.3:123 (checks SNTP client synchronization)
+        if let Some((src_ip, dest_ip, src_port, dest_port, payload)) =
+            parse_udp_packet(&frame).ok().flatten()
+            && dest_port == 123
+        {
+            println!("[isp-test] Verified NTP request on WAN!");
+            let _ = verification_tx.send("NTP_VERIFIED".to_string()).await;
+
+            // Build raw NTP response (48 bytes)
+            let mut ntp_resp = vec![0u8; 48];
+            ntp_resp[0] = 0x24; // LI=0, VN=4, Mode=4 (Server)
+            ntp_resp[1] = 0x01; // Stratum = 1 (primary reference)
+
+            // Copy client's Transmit Timestamp (bytes 40-47 in request payload)
+            // to server's Originate Timestamp (bytes 24-31 in server response)
+            if payload.len() >= 48 {
+                ntp_resp[24..32].copy_from_slice(&payload[40..48]);
+            }
+
+            // Encode current system time as NTP seconds (seconds since 1900) at Transmit Timestamp (bytes 40-47)
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or(std::time::Duration::ZERO);
+            let ntp_secs = now.as_secs() + 2_208_988_800;
+            let secs_bytes = (ntp_secs as u32).to_be_bytes();
+            ntp_resp[40] = secs_bytes[0];
+            ntp_resp[41] = secs_bytes[1];
+            ntp_resp[42] = secs_bytes[2];
+            ntp_resp[43] = secs_bytes[3];
+
+            println!(
+                "[isp-test] Sending NTP Reply to {}:{} from {}:{} with client MAC: {}",
+                src_ip, src_port, dest_ip, dest_port, client_mac
+            );
+
+            let ntp_reply = build_udp_packet(
+                MOCK_SERVER_MAC,
+                client_mac,
+                dest_ip,   // source (NTP server IP)
+                src_ip,    // destination (Router IP)
+                dest_port, // source port (123)
+                src_port,  // destination port (client's ephemeral port)
+                &ntp_resp,
+            );
+            let _ = mock.send_frame(&ntp_reply).await;
             continue;
         }
 
@@ -1264,7 +1335,7 @@ fn parse_icmp_request(
 
 type DnsRequestFields = (Ipv4Addr, Ipv4Addr, u16, u16, Vec<u8>);
 
-fn parse_dns_request(frame: &[u8]) -> Result<Option<DnsRequestFields>, Box<dyn std::error::Error>> {
+fn parse_udp_packet(frame: &[u8]) -> Result<Option<DnsRequestFields>, Box<dyn std::error::Error>> {
     if frame.len() < 42 {
         return Ok(None);
     }
