@@ -81,9 +81,9 @@ mod lease_table {
 
         /// Returns `true` if `ip` is actively leased to a MAC *other* than `client_mac`.
         pub fn is_ip_taken_by_other(&self, ip: Ipv4Addr, client_mac: MacAddr) -> bool {
-            self.by_mac.iter().any(|(mac, l)| {
-                l.ip == ip && l.expiry > Instant::now() && *mac != client_mac
-            })
+            self.by_mac
+                .iter()
+                .any(|(mac, l)| l.ip == ip && l.expiry > Instant::now() && *mac != client_mac)
         }
 
         /// Evicts all expired leases and returns their IPs to the available pool.
@@ -134,7 +134,9 @@ impl std::fmt::Display for ServerError {
         match self {
             ServerError::MacAddress(e) => write!(f, "Failed to get MAC address: {}", e),
             ServerError::RawSocket(e) => write!(f, "Failed to open raw socket: {}", e),
-            ServerError::AsyncSocket(e) => write!(f, "Failed to wrap raw socket in async fd: {}", e),
+            ServerError::AsyncSocket(e) => {
+                write!(f, "Failed to wrap raw socket in async fd: {}", e)
+            }
         }
     }
 }
@@ -157,8 +159,8 @@ async fn setup_server_socket(
     let mac = get_interface_mac(lan_interface)
         .await
         .map_err(|e| ServerError::MacAddress(e.to_string()))?;
-    let raw_fd = open_raw_socket(lan_interface)
-        .map_err(|e| ServerError::RawSocket(e.to_string()))?;
+    let raw_fd =
+        open_raw_socket(lan_interface).map_err(|e| ServerError::RawSocket(e.to_string()))?;
     let async_sock = AsyncFd::new(raw_fd).map_err(|e| {
         unsafe {
             libc::close(raw_fd);
@@ -193,10 +195,7 @@ pub async fn start_dhcp_server(lan_interface: String, lan_ip: String) {
     let start_ip = hosts.next();
     let end_ip = hosts.next_back();
     if let (Some(start), Some(end)) = (start_ip, end_ip) {
-        println!(
-            "[dhcp-server] Dynamic lease pool: {} to {}",
-            start, end
-        );
+        println!("[dhcp-server] Dynamic lease pool: {} to {}", start, end);
     } else {
         println!("[dhcp-server] Dynamic lease pool: (empty)");
     }
@@ -443,8 +442,7 @@ async fn handle_dhcp_discover(
     };
 
     let payload =
-        match build_dhcp_reply_payload(dhcproto::v4::MessageType::Offer, dhcp, leased_ip, config)
-        {
+        match build_dhcp_reply_payload(dhcproto::v4::MessageType::Offer, dhcp, leased_ip, config) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("[dhcp-server] ERROR: {}", e);
@@ -754,7 +752,12 @@ mod tests {
         let leases = LeaseTable::new();
         let client = MacAddr::new(1, 2, 3, 4, 5, 6);
 
-        assert!(!validate_requested_ip(config.server_ip, client, &config, &leases));
+        assert!(!validate_requested_ip(
+            config.server_ip,
+            client,
+            &config,
+            &leases
+        ));
     }
 
     #[test]
@@ -789,9 +792,19 @@ mod tests {
         );
 
         // Another client cannot claim it
-        assert!(!validate_requested_ip(contested_ip, client2, &config, &leases));
+        assert!(!validate_requested_ip(
+            contested_ip,
+            client2,
+            &config,
+            &leases
+        ));
         // But the owning client can renew it
-        assert!(validate_requested_ip(contested_ip, client1, &config, &leases));
+        assert!(validate_requested_ip(
+            contested_ip,
+            client1,
+            &config,
+            &leases
+        ));
     }
 
     #[test]

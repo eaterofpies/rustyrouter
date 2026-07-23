@@ -59,7 +59,10 @@ pub async fn start_dns_forwarder(lease_state: Arc<Mutex<WanLease>>) {
     let upstream_socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            eprintln!("[dns-forwarder] Failed to bind upstream socket: {}. Aborting.", e);
+            eprintln!(
+                "[dns-forwarder] Failed to bind upstream socket: {}. Aborting.",
+                e
+            );
             return;
         }
     };
@@ -99,7 +102,8 @@ pub async fn start_dns_forwarder(lease_state: Arc<Mutex<WanLease>>) {
                 } else {
                     eprintln!(
                         "[dns-forwarder] WARNING: Received DNS spoof attempt! IP {} mismatch for xid {}",
-                        from_addr.ip(), xid
+                        from_addr.ip(),
+                        xid
                     );
                 }
             }
@@ -181,13 +185,8 @@ async fn handle_dns_query(
 
     let upstream_dns = get_upstream_dns(&lease_state);
 
-    if let Some(response) = forward_query(
-        &query,
-        upstream_dns,
-        &upstream_socket,
-        &pending_queries,
-    )
-    .await
+    if let Some(response) =
+        forward_query(&query, upstream_dns, &upstream_socket, &pending_queries).await
     {
         insert_cache(cache_key, response.clone(), &cache);
         let _ = socket.send_to(&response, src).await;
@@ -299,7 +298,11 @@ async fn forward_query(
     forwarded_query[1] = xid_bytes[1];
 
     let upstream_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(upstream_dns), DNS_PORT);
-    if upstream_socket.send_to(&forwarded_query, upstream_addr).await.is_err() {
+    if upstream_socket
+        .send_to(&forwarded_query, upstream_addr)
+        .await
+        .is_err()
+    {
         pending_queries.lock().unwrap().remove(&rng_xid);
         return None;
     }

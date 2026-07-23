@@ -762,38 +762,38 @@ async fn run_mock_wan_isp(
         // C. Handle DNS request to 10.0.2.3:53 (checks DNS forwarding)
         if let Some((src_ip, dest_ip, src_port, dest_port, payload)) =
             parse_dns_request(&frame).ok().flatten()
+            && dest_ip == MOCK_DNS_SERVER
+            && dest_port == 53
         {
-            if dest_ip == MOCK_DNS_SERVER && dest_port == 53 {
-                // Ignore the transaction ID (first 2 bytes) when comparing the query payload
-                if src_ip == MOCK_CLIENT_IP && payload.len() >= 2 && payload[2..] == DNS_QUERY[2..] {
-                    println!("[isp-test] Verified DNS Forwarder query on WAN!");
-                    let _ = verification_tx.send("DNS_VERIFIED".to_string()).await;
-                }
-                
-                // Copy the transaction ID from the query into the response payload
-                let mut response_payload = DNS_RESPONSE.to_vec();
-                if payload.len() >= 2 {
-                    response_payload[0] = payload[0];
-                    response_payload[1] = payload[1];
-                }
-
-                println!(
-                    "[isp-test] Sending DNS Reply to {}:{} from {}:{} with client MAC: {}",
-                    src_ip, src_port, dest_ip, dest_port, client_mac
-                );
-                // Send DNS Reply from 10.0.2.3:53 back to the NATed source
-                let dns_reply = build_udp_packet(
-                    MOCK_SERVER_MAC,
-                    client_mac,
-                    dest_ip,   // 10.0.2.3 (source)
-                    src_ip,    // 10.0.2.15 (destination)
-                    dest_port, // 53 (source port)
-                    src_port,  // router's ephemeral port (destination port)
-                    &response_payload,
-                );
-                let _ = mock.send_frame(&dns_reply).await;
-                continue;
+            // Ignore the transaction ID (first 2 bytes) when comparing the query payload
+            if src_ip == MOCK_CLIENT_IP && payload.len() >= 2 && payload[2..] == DNS_QUERY[2..] {
+                println!("[isp-test] Verified DNS Forwarder query on WAN!");
+                let _ = verification_tx.send("DNS_VERIFIED".to_string()).await;
             }
+
+            // Copy the transaction ID from the query into the response payload
+            let mut response_payload = DNS_RESPONSE.to_vec();
+            if payload.len() >= 2 {
+                response_payload[0] = payload[0];
+                response_payload[1] = payload[1];
+            }
+
+            println!(
+                "[isp-test] Sending DNS Reply to {}:{} from {}:{} with client MAC: {}",
+                src_ip, src_port, dest_ip, dest_port, client_mac
+            );
+            // Send DNS Reply from 10.0.2.3:53 back to the NATed source
+            let dns_reply = build_udp_packet(
+                MOCK_SERVER_MAC,
+                client_mac,
+                dest_ip,   // 10.0.2.3 (source)
+                src_ip,    // 10.0.2.15 (destination)
+                dest_port, // 53 (source port)
+                src_port,  // router's ephemeral port (destination port)
+                &response_payload,
+            );
+            let _ = mock.send_frame(&dns_reply).await;
+            continue;
         }
 
         // D. Handle DHCPREQUEST (renewal)
@@ -1261,9 +1261,9 @@ fn parse_icmp_request(
     Ok(None)
 }
 
-fn parse_dns_request(
-    frame: &[u8],
-) -> Result<Option<(Ipv4Addr, Ipv4Addr, u16, u16, Vec<u8>)>, Box<dyn std::error::Error>> {
+type DnsRequestFields = (Ipv4Addr, Ipv4Addr, u16, u16, Vec<u8>);
+
+fn parse_dns_request(frame: &[u8]) -> Result<Option<DnsRequestFields>, Box<dyn std::error::Error>> {
     if frame.len() < 42 {
         return Ok(None);
     }
