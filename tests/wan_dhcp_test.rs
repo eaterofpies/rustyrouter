@@ -129,6 +129,13 @@ struct TestEnv {
     router_lan_mac: MacAddr,
 }
 
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file("target/wan.sock");
+        let _ = std::fs::remove_file("target/lan.sock");
+    }
+}
+
 macro_rules! run_step {
     ($name:expr, $future:expr, $passed:expr, $failed:expr) => {
         std::print!("test {} ... ", $name);
@@ -187,13 +194,7 @@ async fn main() {
 
     // Tear down VM cleanly
     std::println!("\n=== Cleaning up QEMU VM... ===");
-    drop(env._qemu_guard);
-    let _ = env._qemu_child.kill().await;
-    let _ = env._wan_isp_handle.await;
-
-    // Cleanup socket files
-    let _ = std::fs::remove_file("/workspaces/rustyrouter/target/wan.sock");
-    let _ = std::fs::remove_file("/workspaces/rustyrouter/target/lan.sock");
+    // Sockets and QEMU processes are cleaned up automatically when env goes out of scope.
 
     let elapsed = start_time.elapsed();
     if failed > 0 {
@@ -224,15 +225,15 @@ async fn startup_stage() -> TestEnv {
     assert!(build_status.success(), "Failed to build initramfs");
 
     // Ensure target directory exists
-    let _ = std::fs::create_dir_all("/workspaces/rustyrouter/target");
+    let _ = std::fs::create_dir_all("target");
 
     // Remove any existing socket files
-    let _ = std::fs::remove_file("/workspaces/rustyrouter/target/wan.sock");
-    let _ = std::fs::remove_file("/workspaces/rustyrouter/target/lan.sock");
+    let _ = std::fs::remove_file("target/wan.sock");
+    let _ = std::fs::remove_file("target/lan.sock");
 
     // B. Bind the WAN UNIX socket listener
-    let wan_listener = UnixListener::bind("/workspaces/rustyrouter/target/wan.sock")
-        .expect("Failed to bind WAN UNIX socket");
+    let wan_listener =
+        UnixListener::bind("target/wan.sock").expect("Failed to bind WAN UNIX socket");
 
     // MPSC Channel to coordinate mock WAN ISP and mock LAN client test steps
     let (verification_tx, verification_rx) = tokio::sync::mpsc::channel::<String>(100);
@@ -255,17 +256,18 @@ async fn startup_stage() -> TestEnv {
         "".to_string()
     };
     if kernel.is_empty() {
-        for entry in std::fs::read_dir("/boot").unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            if path.is_file() {
-                let name = path.file_name().unwrap().to_string_lossy();
-                if name.starts_with("vmlinuz-")
-                    && !name.contains("rescue")
-                    && !name.contains("fallback")
-                {
-                    kernel = path.to_string_lossy().into_owned();
-                    break;
+        if let Ok(entries) = std::fs::read_dir("/boot") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let name = path.file_name().unwrap().to_string_lossy();
+                    if name.starts_with("vmlinuz-")
+                        && !name.contains("rescue")
+                        && !name.contains("fallback")
+                    {
+                        kernel = path.to_string_lossy().into_owned();
+                        break;
+                    }
                 }
             }
         }
@@ -279,9 +281,9 @@ async fn startup_stage() -> TestEnv {
             "-kernel", &kernel,
             "-initrd", "target/initramfs.cpio.gz",
             "-append", "console=ttyS0 quiet panic=-1 net.ifnames=0 rustyrouter.wan=eth0 rustyrouter.lan=eth1 rustyrouter.lan_ip=192.168.1.1/24",
-            "-netdev", "stream,id=wan0,server=off,addr.type=unix,addr.path=/workspaces/rustyrouter/target/wan.sock",
+            "-netdev", "stream,id=wan0,server=off,addr.type=unix,addr.path=target/wan.sock",
             "-device", "virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56,romfile=",
-            "-netdev", "stream,id=lan0,server=on,addr.type=unix,addr.path=/workspaces/rustyrouter/target/lan.sock",
+            "-netdev", "stream,id=lan0,server=on,addr.type=unix,addr.path=target/lan.sock",
             "-device", "virtio-net-pci,netdev=lan0,mac=52:54:00:12:34:57,romfile=",
             "-nographic",
         ])
@@ -336,9 +338,8 @@ async fn startup_stage() -> TestEnv {
     let mut lan_stream = None;
     let start_lan = std::time::Instant::now();
     while start_lan.elapsed() < Duration::from_secs(10) {
-        if std::path::Path::new("/workspaces/rustyrouter/target/lan.sock").exists()
-            && let Ok(stream) =
-                tokio::net::UnixStream::connect("/workspaces/rustyrouter/target/lan.sock").await
+        if std::path::Path::new("target/lan.sock").exists()
+            && let Ok(stream) = tokio::net::UnixStream::connect("target/lan.sock").await
         {
             lan_stream = Some(stream);
             break;
