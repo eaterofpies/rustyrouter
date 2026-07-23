@@ -4,7 +4,6 @@ use super::utils::{
 use crate::packet::build_raw_packet;
 use pnet::packet::ethernet::EthernetPacket;
 use pnet::util::MacAddr;
-use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
@@ -14,81 +13,133 @@ const LAN_LEASE_SECS: u32 = 3600;
 const SERVER_RESTART_DELAY_SECS: u64 = 5;
 
 // =========================================================================
+// Lease Table
+// =========================================================================
+
+/// Private submodule so `LeaseTable`'s fields are inaccessible even from
+/// the rest of this file. All mutations must go through the public methods,
+/// making it structurally impossible for the map and index to diverge.
+mod lease_table {
+    use std::collections::{HashMap, HashSet};
+    use std::net::Ipv4Addr;
+    use std::time::Instant;
+
+    use pnet::util::MacAddr;
+
+    #[derive(Debug, Clone)]
+    pub struct ClientLease {
+        pub ip: Ipv4Addr,
+        pub expiry: Instant,
+    }
+
+    /// Encapsulates the lease map and IP allocation index as a single unit.
+    ///
+    /// `by_mac` and `allocated_ips` are private to this module. An IP is
+    /// always in `allocated_ips` **if and only if** there is a live
+    /// corresponding entry in `by_mac`. Use the public methods to mutate.
+    pub struct LeaseTable {
+        by_mac: HashMap<MacAddr, ClientLease>,
+        /// O(1) index of currently allocated IPs. Always kept in sync with `by_mac`.
+        allocated_ips: HashSet<Ipv4Addr>,
+    }
+
+    impl LeaseTable {
+        pub fn new() -> Self {
+            Self {
+                by_mac: HashMap::new(),
+                allocated_ips: HashSet::new(),
+            }
+        }
+
+        /// Returns the active lease for this MAC address, if one exists.
+        pub fn get(&self, mac: &MacAddr) -> Option<&ClientLease> {
+            self.by_mac.get(mac)
+        }
+
+        /// Inserts or replaces the lease for `mac`, updating the IP index atomically.
+        pub fn insert(&mut self, mac: MacAddr, lease: ClientLease) {
+            // Release the old IP from the index if this MAC already had a lease.
+            if let Some(old) = self.by_mac.get(&mac) {
+                self.allocated_ips.remove(&old.ip);
+            }
+            self.allocated_ips.insert(lease.ip);
+            self.by_mac.insert(mac, lease);
+        }
+
+        /// Removes the lease for `mac` and updates the IP index atomically.
+        /// Returns the removed lease, or `None` if no lease existed.
+        pub fn remove(&mut self, mac: &MacAddr) -> Option<ClientLease> {
+            let lease = self.by_mac.remove(mac)?;
+            self.allocated_ips.remove(&lease.ip);
+            Some(lease)
+        }
+
+        /// Returns `true` if `ip` is not currently held by any client.
+        pub fn is_ip_available(&self, ip: Ipv4Addr) -> bool {
+            !self.allocated_ips.contains(&ip)
+        }
+
+        /// Returns `true` if `ip` is actively leased to a MAC *other* than `client_mac`.
+        pub fn is_ip_taken_by_other(&self, ip: Ipv4Addr, client_mac: MacAddr) -> bool {
+            self.by_mac.iter().any(|(mac, l)| {
+                l.ip == ip && l.expiry > Instant::now() && *mac != client_mac
+            })
+        }
+
+        /// Evicts all expired leases and returns their IPs to the available pool.
+        ///
+        /// The `allocated_ips` index is rebuilt from the remaining live leases
+        /// after eviction, guaranteeing the two structures stay in sync.
+        pub fn evict_expired(&mut self) {
+            self.by_mac.retain(|_, l| l.expiry > Instant::now());
+            self.allocated_ips = self.by_mac.values().map(|l| l.ip).collect();
+        }
+
+        /// Evicts expired leases, then finds the first available host IP in
+        /// `net` that is not `server_ip`.
+        pub fn next_available_ip(
+            &mut self,
+            net: ipnet::Ipv4Net,
+            server_ip: Ipv4Addr,
+        ) -> Option<Ipv4Addr> {
+            self.evict_expired();
+            net.hosts()
+                .find(|&ip| ip != server_ip && self.is_ip_available(ip))
+        }
+
+        /// Number of active (non-expired) leases. Used in tests.
+        #[cfg(test)]
+        pub fn len(&self) -> usize {
+            self.by_mac.len()
+        }
+    }
+}
+
+use lease_table::{ClientLease, LeaseTable};
+
+// =========================================================================
 // DHCP Server (LAN)
 // =========================================================================
-#[derive(Debug, Clone)]
-struct ClientLease {
-    ip: Ipv4Addr,
-    expiry: Instant,
+
+/// Typed errors for server socket setup, replacing opaque `String` returns.
+#[derive(Debug)]
+enum ServerError {
+    MacAddress(String),
+    RawSocket(String),
+    AsyncSocket(String),
 }
 
-/// Encapsulates the lease map and IP allocation index as a single unit.
-///
-/// Both fields are private. All mutations go through methods on this struct,
-/// so the two data structures are guaranteed to remain consistent: an IP is
-/// always in `allocated_ips` if and only if there is a corresponding entry
-/// in `by_mac`.
-struct LeaseTable {
-    by_mac: HashMap<MacAddr, ClientLease>,
-    /// O(1) index of currently allocated IPs. Always kept in sync with `by_mac`.
-    allocated_ips: HashSet<Ipv4Addr>,
-}
-
-impl LeaseTable {
-    fn new() -> Self {
-        Self {
-            by_mac: HashMap::new(),
-            allocated_ips: HashSet::new(),
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerError::MacAddress(e) => write!(f, "Failed to get MAC address: {}", e),
+            ServerError::RawSocket(e) => write!(f, "Failed to open raw socket: {}", e),
+            ServerError::AsyncSocket(e) => write!(f, "Failed to wrap raw socket in async fd: {}", e),
         }
     }
-
-    /// Returns the active lease for this MAC address, if one exists.
-    fn get(&self, mac: &MacAddr) -> Option<&ClientLease> {
-        self.by_mac.get(mac)
-    }
-
-    /// Inserts or replaces the lease for `mac`, updating the IP index atomically.
-    fn insert(&mut self, mac: MacAddr, lease: ClientLease) {
-        // If this MAC already has a lease, release its old IP from the index.
-        if let Some(old) = self.by_mac.get(&mac) {
-            self.allocated_ips.remove(&old.ip);
-        }
-        self.allocated_ips.insert(lease.ip);
-        self.by_mac.insert(mac, lease);
-    }
-
-    /// Removes the lease for `mac` and updates the IP index atomically.
-    /// Returns the removed lease, or `None` if no lease existed.
-    fn remove(&mut self, mac: &MacAddr) -> Option<ClientLease> {
-        let lease = self.by_mac.remove(mac)?;
-        self.allocated_ips.remove(&lease.ip);
-        Some(lease)
-    }
-
-    /// Returns `true` if `ip` is not currently held by any client.
-    fn is_ip_available(&self, ip: Ipv4Addr) -> bool {
-        !self.allocated_ips.contains(&ip)
-    }
-
-    /// Returns `true` if `ip` is actively leased to a MAC *other* than `client_mac`.
-    fn is_ip_taken_by_other(&self, ip: Ipv4Addr, client_mac: MacAddr) -> bool {
-        self.by_mac.iter().any(|(mac, l)| {
-            l.ip == ip && l.expiry > Instant::now() && *mac != client_mac
-        })
-    }
-
-    /// Finds the first available host IP in `net`, excluding `server_ip`.
-    fn next_available_ip(&self, net: ipnet::Ipv4Net, server_ip: Ipv4Addr) -> Option<Ipv4Addr> {
-        net.hosts()
-            .find(|&ip| ip != server_ip && self.is_ip_available(ip))
-    }
-
-    /// Number of active leases. Used in tests.
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.by_mac.len()
-    }
 }
+
+impl std::error::Error for ServerError {}
 
 /// Fixed server configuration derived from the LAN interface at startup.
 /// Passed by reference throughout the server loop to avoid repeating
@@ -102,17 +153,17 @@ struct ServerConfig {
 
 async fn setup_server_socket(
     lan_interface: &str,
-) -> Result<(MacAddr, RawFd, AsyncFd<RawFd>), String> {
+) -> Result<(MacAddr, RawFd, AsyncFd<RawFd>), ServerError> {
     let mac = get_interface_mac(lan_interface)
         .await
-        .map_err(|e| format!("Failed to get MAC address: {}", e))?;
-    let raw_fd =
-        open_raw_socket(lan_interface).map_err(|e| format!("Failed to open raw socket: {}", e))?;
+        .map_err(|e| ServerError::MacAddress(e.to_string()))?;
+    let raw_fd = open_raw_socket(lan_interface)
+        .map_err(|e| ServerError::RawSocket(e.to_string()))?;
     let async_sock = AsyncFd::new(raw_fd).map_err(|e| {
         unsafe {
             libc::close(raw_fd);
         }
-        format!("Failed to wrap raw socket: {}", e)
+        ServerError::AsyncSocket(e.to_string())
     })?;
     Ok((mac, raw_fd, async_sock))
 }
@@ -368,7 +419,7 @@ async fn handle_dhcp_discover(
         client_mac
     );
 
-    // Re-offer the same IP if this client already has a lease.
+    // Re-offer the same IP if this client already has a live lease.
     let leased_ip = if let Some(existing) = leases.get(&client_mac) {
         existing.ip
     } else {
@@ -524,15 +575,25 @@ mod tests {
         }
     }
 
-    fn allocate(leases: &mut LeaseTable, mac: MacAddr, net: ipnet::Ipv4Net, server_ip: Ipv4Addr) -> Option<Ipv4Addr> {
+    /// Mirrors the allocation path in `handle_dhcp_discover`: re-offer an
+    /// existing lease, only scan the pool for first-time clients.
+    fn discover_ip(
+        leases: &mut LeaseTable,
+        mac: MacAddr,
+        net: ipnet::Ipv4Net,
+        server_ip: Ipv4Addr,
+    ) -> Option<Ipv4Addr> {
         if let Some(existing) = leases.get(&mac) {
             return Some(existing.ip);
         }
         let ip = leases.next_available_ip(net, server_ip)?;
-        leases.insert(mac, ClientLease {
-            ip,
-            expiry: Instant::now() + Duration::from_secs(LAN_LEASE_SECS as u64),
-        });
+        leases.insert(
+            mac,
+            ClientLease {
+                ip,
+                expiry: Instant::now() + Duration::from_secs(LAN_LEASE_SECS as u64),
+            },
+        );
         Some(ip)
     }
 
@@ -544,100 +605,21 @@ mod tests {
         let client1 = MacAddr::new(1, 2, 3, 4, 5, 6);
 
         // First allocation
-        let ip1 = allocate(&mut leases, client1, net, server_ip);
-        assert!(ip1.is_some());
-        let ip1 = ip1.unwrap();
+        let ip1 = discover_ip(&mut leases, client1, net, server_ip).unwrap();
         assert_ne!(ip1, server_ip);
         assert!(net.hosts().any(|h| h == ip1));
         assert!(!leases.is_ip_available(ip1));
 
         // Same client gets same IP
-        let ip2 = allocate(&mut leases, client1, net, server_ip);
-        assert_eq!(ip2, Some(ip1));
+        assert_eq!(discover_ip(&mut leases, client1, net, server_ip), Some(ip1));
         assert_eq!(leases.len(), 1);
 
         // Different client gets a different IP
         let client2 = MacAddr::new(1, 2, 3, 4, 5, 7);
-        let ip3 = allocate(&mut leases, client2, net, server_ip);
-        assert!(ip3.is_some());
-        let ip3 = ip3.unwrap();
+        let ip3 = discover_ip(&mut leases, client2, net, server_ip).unwrap();
         assert_ne!(ip3, ip1);
         assert_ne!(ip3, server_ip);
         assert!(!leases.is_ip_available(ip3));
-    }
-
-    /// Simulates the discover allocation path from `handle_dhcp_discover`:
-    /// check existing lease first, only scan for a new IP if none exists.
-    fn discover_ip(
-        leases: &mut LeaseTable,
-        mac: MacAddr,
-        net: ipnet::Ipv4Net,
-        server_ip: Ipv4Addr,
-    ) -> Option<Ipv4Addr> {
-        if let Some(existing) = leases.get(&mac) {
-            return Some(existing.ip);
-        }
-        let ip = leases.next_available_ip(net, server_ip)?;
-        leases.insert(mac, ClientLease {
-            ip,
-            expiry: Instant::now() + Duration::from_secs(LAN_LEASE_SECS as u64),
-        });
-        Some(ip)
-    }
-
-    /// Regression test for the bug where a re-discovering client was allocated
-    /// a fresh IP instead of having its existing lease re-offered.
-    ///
-    /// Before the fix, `next_available_ip` was called first. When the pool was
-    /// not exhausted this returned a *different* IP, and `LeaseTable::insert`
-    /// would evict the old lease and assign the new one — meaning a client's
-    /// IP changed on every DISCOVER.
-    #[test]
-    fn test_discover_reoffers_existing_lease_ip() {
-        let net: ipnet::Ipv4Net = "192.168.1.1/24".parse().unwrap();
-        let server_ip = net.addr();
-        let mut leases = LeaseTable::new();
-        let client = MacAddr::new(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF);
-
-        // First DISCOVER: allocates an IP from the (non-exhausted) pool.
-        let ip_first = discover_ip(&mut leases, client, net, server_ip).unwrap();
-        assert_ne!(ip_first, server_ip);
-        assert_eq!(leases.len(), 1);
-
-        // Second DISCOVER from the same client: must return the *same* IP,
-        // not a new one, even though free IPs are available in the pool.
-        let ip_second = discover_ip(&mut leases, client, net, server_ip).unwrap();
-        assert_eq!(ip_second, ip_first, "re-DISCOVER must re-offer the same IP");
-
-        // The lease table must still contain exactly one entry.
-        assert_eq!(leases.len(), 1);
-
-        // The originally allocated IP must still be marked as taken.
-        assert!(!leases.is_ip_available(ip_first));
-    }
-
-    /// Ensures that when the pool is fully exhausted an existing client's
-    /// DISCOVER still succeeds (re-offer), while a new client gets None.
-    #[test]
-    fn test_discover_exhausted_pool_reoffers_existing_client() {
-        // /30: only .2 is available (server is .1)
-        let net: ipnet::Ipv4Net = "192.168.1.1/30".parse().unwrap();
-        let server_ip = net.addr();
-        let mut leases = LeaseTable::new();
-
-        let existing_client = MacAddr::new(1, 2, 3, 4, 5, 6);
-        let new_client     = MacAddr::new(1, 2, 3, 4, 5, 7);
-
-        // Allocate the only available IP to the existing client.
-        let ip = discover_ip(&mut leases, existing_client, net, server_ip).unwrap();
-        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 2));
-
-        // Pool is now exhausted — a new client must get None.
-        assert_eq!(discover_ip(&mut leases, new_client, net, server_ip), None);
-
-        // The existing client must still get its IP re-offered.
-        let ip_reoffered = discover_ip(&mut leases, existing_client, net, server_ip).unwrap();
-        assert_eq!(ip_reoffered, ip, "existing client must be re-offered its lease IP even when pool is exhausted");
     }
 
     #[test]
@@ -648,13 +630,14 @@ mod tests {
         let mut leases = LeaseTable::new();
 
         let client1 = MacAddr::new(1, 2, 3, 4, 5, 6);
-        let ip1 = allocate(&mut leases, client1, net, server_ip);
-        assert_eq!(ip1, Some(Ipv4Addr::new(192, 168, 1, 2)));
+        assert_eq!(
+            discover_ip(&mut leases, client1, net, server_ip),
+            Some(Ipv4Addr::new(192, 168, 1, 2))
+        );
 
         // Pool exhausted for a second client
         let client2 = MacAddr::new(1, 2, 3, 4, 5, 7);
-        let ip2 = allocate(&mut leases, client2, net, server_ip);
-        assert_eq!(ip2, None);
+        assert_eq!(discover_ip(&mut leases, client2, net, server_ip), None);
     }
 
     #[test]
@@ -664,7 +647,7 @@ mod tests {
         let mut leases = LeaseTable::new();
         let client = MacAddr::new(1, 2, 3, 4, 5, 6);
 
-        let ip = allocate(&mut leases, client, net, server_ip).unwrap();
+        let ip = discover_ip(&mut leases, client, net, server_ip).unwrap();
         assert!(!leases.is_ip_available(ip));
 
         // Decline removes the lease and frees the IP atomically
@@ -673,7 +656,7 @@ mod tests {
         assert!(leases.is_ip_available(ip));
 
         // Re-allocation returns the same IP
-        let ip2 = allocate(&mut leases, client, net, server_ip).unwrap();
+        let ip2 = discover_ip(&mut leases, client, net, server_ip).unwrap();
         assert_eq!(ip2, ip);
         assert_eq!(leases.len(), 1);
 
@@ -681,6 +664,83 @@ mod tests {
         handle_dhcp_release(client, &mut leases);
         assert_eq!(leases.len(), 0);
         assert!(leases.is_ip_available(ip));
+    }
+
+    /// Verifies that expired leases are evicted and their IPs returned to the
+    /// pool when `next_available_ip` is called.
+    #[test]
+    fn test_evict_expired_returns_ip_to_pool() {
+        let net: ipnet::Ipv4Net = "192.168.1.1/30".parse().unwrap();
+        let server_ip = net.addr();
+        let mut leases = LeaseTable::new();
+        let client = MacAddr::new(1, 2, 3, 4, 5, 6);
+
+        // Insert a lease that has already expired.
+        leases.insert(
+            client,
+            ClientLease {
+                ip: Ipv4Addr::new(192, 168, 1, 2),
+                expiry: Instant::now() - Duration::from_secs(1),
+            },
+        );
+        assert_eq!(leases.len(), 1);
+        assert!(!leases.is_ip_available(Ipv4Addr::new(192, 168, 1, 2)));
+
+        // A new client should be able to claim the expired IP after eviction.
+        let new_client = MacAddr::new(1, 2, 3, 4, 5, 7);
+        let ip = discover_ip(&mut leases, new_client, net, server_ip);
+        assert_eq!(
+            ip,
+            Some(Ipv4Addr::new(192, 168, 1, 2)),
+            "expired lease IP must be returned to the pool"
+        );
+        // The expired entry must have been removed.
+        assert_eq!(leases.len(), 1);
+        assert!(leases.get(&client).is_none());
+    }
+
+    /// Regression test: re-discovering client must always get the same IP,
+    /// not a freshly allocated one from the pool.
+    #[test]
+    fn test_discover_reoffers_existing_lease_ip() {
+        let net: ipnet::Ipv4Net = "192.168.1.1/24".parse().unwrap();
+        let server_ip = net.addr();
+        let mut leases = LeaseTable::new();
+        let client = MacAddr::new(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF);
+
+        let ip_first = discover_ip(&mut leases, client, net, server_ip).unwrap();
+        assert_ne!(ip_first, server_ip);
+        assert_eq!(leases.len(), 1);
+
+        let ip_second = discover_ip(&mut leases, client, net, server_ip).unwrap();
+        assert_eq!(ip_second, ip_first, "re-DISCOVER must re-offer the same IP");
+        assert_eq!(leases.len(), 1);
+        assert!(!leases.is_ip_available(ip_first));
+    }
+
+    /// Ensures an existing client can still be re-offered its IP even when
+    /// the pool is exhausted for new clients.
+    #[test]
+    fn test_discover_exhausted_pool_reoffers_existing_client() {
+        // /30: only .2 is available (server is .1)
+        let net: ipnet::Ipv4Net = "192.168.1.1/30".parse().unwrap();
+        let server_ip = net.addr();
+        let mut leases = LeaseTable::new();
+
+        let existing_client = MacAddr::new(1, 2, 3, 4, 5, 6);
+        let new_client = MacAddr::new(1, 2, 3, 4, 5, 7);
+
+        let ip = discover_ip(&mut leases, existing_client, net, server_ip).unwrap();
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 2));
+
+        // Pool is exhausted — new client gets None.
+        assert_eq!(discover_ip(&mut leases, new_client, net, server_ip), None);
+
+        // Existing client still gets its IP re-offered.
+        assert_eq!(
+            discover_ip(&mut leases, existing_client, net, server_ip),
+            Some(ip)
+        );
     }
 
     #[test]
@@ -715,10 +775,13 @@ mod tests {
         let client2 = MacAddr::new(1, 2, 3, 4, 5, 7);
         let contested_ip = Ipv4Addr::new(192, 168, 1, 2);
 
-        leases.insert(client1, ClientLease {
-            ip: contested_ip,
-            expiry: Instant::now() + Duration::from_secs(LAN_LEASE_SECS as u64),
-        });
+        leases.insert(
+            client1,
+            ClientLease {
+                ip: contested_ip,
+                expiry: Instant::now() + Duration::from_secs(LAN_LEASE_SECS as u64),
+            },
+        );
 
         // Another client cannot claim it
         assert!(!validate_requested_ip(contested_ip, client2, &config, &leases));
