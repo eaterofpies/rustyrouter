@@ -269,10 +269,43 @@ fn find_module_recursive(dir: &Path, base_name: &str) -> Option<std::path::PathB
     None
 }
 
+/// Resolves the true kernel release name.
+/// We read from `/proc/version` because when a 32-bit binary runs on a 64-bit kernel
+/// in compatibility mode (`CONFIG_COMPAT`), the kernel intercepts the `uname` system
+/// call and spoofs the release name to a 32-bit version (e.g. returning `6.1.21-v7+`
+/// instead of the true `6.1.21-v8+`).
+/// Since `/proc/version` is generated directly by the kernel procfs and is not rewritten
+/// by the compat wrapper, parsing it gives us the un-spoofed release name (the third token).
+fn get_kernel_release() -> String {
+    if let Ok(content) = fs::read_to_string("/proc/version") {
+        let parts: Vec<&str> = content.split_whitespace().collect();
+        if parts.len() > 2 && parts[0] == "Linux" && parts[1] == "version" {
+            return parts[2].to_string();
+        }
+    }
+    // Fall back to standard uname if /proc is not mounted yet during early boot stage
+    if let Ok(uts) = nix::sys::utsname::uname() {
+        if let Some(release) = uts.release().to_str() {
+            return release.to_string();
+        }
+    }
+    String::new()
+}
+
+/// Finds the module path corresponding to the active kernel release directory.
+/// Restricting the search path to `/lib/modules/<kernel_release>/` is crucial:
+/// because the initramfs contains coexisting 32-bit and 64-bit modules side-by-side,
+/// a blind recursive search could accidentally locate and try to load a module
+/// of the wrong ELF class (e.g. a 32-bit module under a 64-bit kernel), leading to
+/// an `ENOEXEC` (Invalid architecture in ELF header) failure during boot.
 fn find_module_file(name: &str) -> Option<std::path::PathBuf> {
-    let modules_dir = Path::new("/lib/modules");
+    let kdir = get_kernel_release();
+    if kdir.is_empty() {
+        return None;
+    }
+    let modules_dir = Path::new("/lib/modules").join(kdir);
     let base_name = format!("{}.ko", name);
-    find_module_recursive(modules_dir, &base_name)
+    find_module_recursive(&modules_dir, &base_name)
 }
 
 fn decompress_module(data: &[u8], path: &Path) -> Result<Vec<u8>, std::io::Error> {

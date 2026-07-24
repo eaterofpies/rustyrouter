@@ -18,6 +18,9 @@ RUN apt-get update \
     libclang-dev \
     linux-image-cloud-amd64 \
     make \
+    mtools \
+    parted \
+    qemu-system-arm \
     qemu-system-x86 \
     ssh \
     sudo \

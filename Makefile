@@ -1,8 +1,8 @@
 # =========================================================================
-# Rustyrouter Makefile
+# Rustyrouter main Makefile (Host x86_64 Simulation)
 # =========================================================================
 
-.PHONY: all clean qemu
+.PHONY: all clean qemu image run-qemu
 
 # Target files
 BINARY := target/x86_64-unknown-linux-musl/release/rustyrouter
@@ -50,12 +50,15 @@ $(INITRAMFS): $(BINARY)
 	@(cd $(STAGING) && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > ../initramfs.cpio.gz)
 	@echo "[build] Initramfs archived successfully at: $(INITRAMFS)"
 
-# Run interactive QEMU simulation
+# Run interactive QEMU simulation (x86_64 host target)
 qemu: $(INITRAMFS)
 	@./test_qemu.sh
 
 # Clean build artifacts
-clean:
+clean: clean-rpi
 	@echo "[clean] Cleaning build target and staging directories..."
 	@cargo clean
 	@rm -rf $(STAGING) $(INITRAMFS)
+
+# Include Raspberry Pi build rules
+include Makefile.rpi
