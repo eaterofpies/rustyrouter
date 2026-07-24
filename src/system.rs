@@ -269,24 +269,17 @@ fn find_module_recursive(dir: &Path, base_name: &str) -> Option<std::path::PathB
     None
 }
 
-/// Resolves the true kernel release name.
+/// Resolves the true kernel release name by reading `/proc/version`.
 /// We read from `/proc/version` because when a 32-bit binary runs on a 64-bit kernel
 /// in compatibility mode (`CONFIG_COMPAT`), the kernel intercepts the `uname` system
-/// call and spoofs the release name to a 32-bit version (e.g. returning `6.1.21-v7+`
-/// instead of the true `6.1.21-v8+`).
-/// Since `/proc/version` is generated directly by the kernel procfs and is not rewritten
-/// by the compat wrapper, parsing it gives us the un-spoofed release name (the third token).
+/// call and spoofs the release name (returning `6.1.21-v7+` instead of `6.1.21-v8+`).
+/// Since `/proc/version` is generated directly by procfs and is not spoofed by the compat layer,
+/// parsing it gives us the un-spoofed release name (the third token).
 fn get_kernel_release() -> String {
     if let Ok(content) = fs::read_to_string("/proc/version") {
         let parts: Vec<&str> = content.split_whitespace().collect();
         if parts.len() > 2 && parts[0] == "Linux" && parts[1] == "version" {
             return parts[2].to_string();
-        }
-    }
-    // Fall back to standard uname if /proc is not mounted yet during early boot stage
-    if let Ok(uts) = nix::sys::utsname::uname() {
-        if let Some(release) = uts.release().to_str() {
-            return release.to_string();
         }
     }
     String::new()
@@ -371,6 +364,9 @@ fn load_single_module(mod_name: &str) {
 }
 
 pub fn load_required_modules() {
+    if !std::path::Path::new("/proc/version").exists() {
+        panic!("FATAL: /proc is not mounted. Cannot safely load kernel modules.");
+    }
     let modules = [
         "failover",
         "net_failover",
