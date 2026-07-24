@@ -7,6 +7,10 @@
 # Default architecture: x86_64 (Host simulation). Can be overridden via ARCH=arm64 or ARCH=armhf
 ARCH ?= x86_64
 
+# Direct (leaf) kernel dependencies required by the router's virtual interfaces and firewall rules.
+# Transitive dependencies (e.g. nf_tables, nf_conntrack, nf_nat, nfnetlink, crc32c) are resolved automatically.
+DIRECT_DEPS := virtio_net virtio_pci virtio_mmio nft_masq nft_chain_nat nft_ct
+
 # Architecture mapping to rust target and QEMU setup
 ifeq ($(ARCH),x86_64)
     RUST_TARGET := x86_64-unknown-linux-musl
@@ -105,15 +109,20 @@ $(INITRAMFS): $(BINARY) $(TEST_BOOT_DIR)/.kernel_extracted
 	@mknod -m 666 $(STAGING)/dev/null c 1 3 2>/dev/null || true
 	@KVER=$$(ls $(TEST_BOOT_DIR)/lib/modules 2>/dev/null | head -n 1); \
 	if [ -n "$$KVER" ]; then \
-		echo "[build] Staging $(ARCH) kernel modules ($$KVER)..."; \
+		echo "[build] Generating kernel dependency database for $$KVER..."; \
+		depmod -b $(TEST_BOOT_DIR) $$KVER; \
+		echo "[build] Staging $(ARCH) kernel modules..."; \
 		mkdir -p $(STAGING)/lib/modules/$$KVER; \
-		for mod in virtio virtio_ring virtio_mmio virtio_pci_modern_dev virtio_pci_legacy_dev virtio_pci failover net_failover virtio_net nfnetlink crc32c_generic libcrc32c nf_defrag_ipv4 nf_defrag_ipv6 nf_tables nf_conntrack nf_nat nft_ct nft_chain_nat nft_masq; do \
-			found=$$(find "$(TEST_BOOT_DIR)/lib/modules/$$KVER" -name "$${mod}.ko" -o -name "$${mod}.ko.zst" -o -name "$${mod}.ko.xz" -o -name "$${mod}.ko.gz" 2>/dev/null | head -n 1); \
-			if [ -n "$$found" ]; then \
-				cp "$$found" "$(STAGING)/lib/modules/$$KVER/"; \
-			fi; \
+		for dep in $(DIRECT_DEPS); do \
+			paths=$$(modprobe -d $(TEST_BOOT_DIR) -S $$KVER --show-depends $$dep 2>/dev/null | awk '/^insmod/ {print $$2}'); \
+			for path in $$paths; do \
+				cp "$$path" "$(STAGING)/lib/modules/$$KVER/" 2>/dev/null || true; \
+			done; \
 		done; \
+		echo "[build] Staging modules.dep for guest loading..."; \
+		cp "$(TEST_BOOT_DIR)/lib/modules/$$KVER/modules.dep" "$(STAGING)/lib/modules/$$KVER/" 2>/dev/null || true; \
 	fi
+
 	@echo "[build] Packaging initramfs into $(INITRAMFS)..."
 	@mkdir -p target/$(ARCH)
 	@(cd $(STAGING) && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > ../initramfs.cpio.gz)
