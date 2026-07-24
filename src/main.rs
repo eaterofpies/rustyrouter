@@ -15,6 +15,7 @@ macro_rules! eprintln {
 }
 
 mod config;
+mod kmod;
 mod netfilter;
 mod network;
 mod packet;
@@ -62,8 +63,23 @@ async fn start_power_button_monitor<S: SystemOps>(sys: Arc<S>, shutdown_flag: Ar
 
 #[tokio::main]
 async fn main() {
-    let sys = Arc::new(RealSystem);
+    let args: Vec<String> = std::env::args().collect();
+    let is_modprobe = args.first().is_some_and(|arg0| arg0.contains("modprobe"))
+        || args.get(1).is_some_and(|arg1| arg1 == "modprobe");
 
+    if is_modprobe {
+        if let Err(e) = kmod::run_as_modprobe(args) {
+            eprintln!("[modprobe] ERROR: {}", e);
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
+    let sys = Arc::new(RealSystem);
+    run_as_init(sys).await;
+}
+
+async fn run_as_init(sys: Arc<RealSystem>) {
     // For PID 1, redirect standard descriptors (0, 1, 2) to /dev/console
     if sys.getpid() == Pid::from_raw(1)
         && let Ok(console) = std::fs::OpenOptions::new()
@@ -94,7 +110,7 @@ async fn main() {
             let _ = sys.reboot(RebootMode::RB_AUTOBOOT);
             return;
         }
-        system::load_required_modules();
+        kmod::load_required_modules();
     } else {
         println!(
             "[init] Running in standard user environment (PID {}). Skipping VFS mounts.",

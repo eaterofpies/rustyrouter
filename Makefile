@@ -116,12 +116,17 @@ $(INITRAMFS): $(BINARY) $(TEST_BOOT_DIR)/.kernel_extracted
 		for dep in $(DIRECT_DEPS); do \
 			paths=$$(modprobe -d $(TEST_BOOT_DIR) -S $$KVER --show-depends $$dep 2>/dev/null | awk '/^insmod/ {print $$2}'); \
 			for path in $$paths; do \
-				cp "$$path" "$(STAGING)/lib/modules/$$KVER/" 2>/dev/null || true; \
+				rel_path=$${path#$(TEST_BOOT_DIR)/lib/modules/$$KVER/}; \
+				mkdir -p "$(STAGING)/lib/modules/$$KVER/$$(dirname $$rel_path)"; \
+				cp "$$path" "$(STAGING)/lib/modules/$$KVER/$$rel_path" 2>/dev/null || true; \
 			done; \
 		done; \
-		echo "[build] Staging modules.dep for guest loading..."; \
+		echo "[build] Staging modules.dep and modules.alias for guest loading..."; \
 		cp "$(TEST_BOOT_DIR)/lib/modules/$$KVER/modules.dep" "$(STAGING)/lib/modules/$$KVER/" 2>/dev/null || true; \
+		cp "$(TEST_BOOT_DIR)/lib/modules/$$KVER/modules.alias" "$(STAGING)/lib/modules/$$KVER/" 2>/dev/null || true; \
 	fi
+	@mkdir -p $(STAGING)/sbin
+	@ln -sf ../init $(STAGING)/sbin/modprobe
 
 	@echo "[build] Packaging initramfs into $(INITRAMFS)..."
 	@mkdir -p target/$(ARCH)

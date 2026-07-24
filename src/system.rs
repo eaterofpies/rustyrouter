@@ -91,6 +91,13 @@ pub fn mount_virtual_filesystems<S: SystemOps>(sys: &S) -> Result<(), String> {
         .map_err(|e| format!("Failed to mount /run: {}", e))?;
     println!("[init] Mounted /run successfully.");
 
+    // Set kernel modprobe helper path to trigger lazy loading
+    if let Err(e) = fs::write("/proc/sys/kernel/modprobe", "/sbin/modprobe") {
+        println!("[init] Warning: Failed to set /proc/sys/kernel/modprobe: {}", e);
+    } else {
+        println!("[init] Configured kernel modprobe path to /sbin/modprobe.");
+    }
+
     Ok(())
 }
 
@@ -242,146 +249,5 @@ mod tests {
 
         let reboot_called = sys.reboot_call.lock().unwrap();
         assert_eq!(*reboot_called, Some(RebootMode::RB_AUTOBOOT));
-    }
-}
-
-use std::path::Path;
-
-fn find_module_recursive(dir: &Path, base_name: &str) -> Option<std::path::PathBuf> {
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir()
-            && let Some(found) = find_module_recursive(&path, base_name)
-        {
-            return Some(found);
-        }
-        if !path.is_dir()
-            && let Some(file_name_str) = path.file_name().and_then(|n| n.to_str())
-            && (file_name_str == base_name
-                || file_name_str == format!("{}.xz", base_name)
-                || file_name_str == format!("{}.gz", base_name)
-                || file_name_str == format!("{}.zst", base_name))
-        {
-            return Some(path);
-        }
-    }
-    None
-}
-
-/// Resolves the active kernel release name.
-fn get_kernel_release() -> String {
-    if let Ok(uts) = nix::sys::utsname::uname() {
-        if let Some(release) = uts.release().to_str() {
-            return release.to_string();
-        }
-    }
-    String::new()
-}
-
-/// Finds the module path corresponding to the active kernel release directory.
-/// Restricting the search path to `/lib/modules/<kernel_release>/` is crucial:
-/// because the initramfs contains coexisting 32-bit and 64-bit modules side-by-side,
-/// a blind recursive search could accidentally locate and try to load a module
-/// of the wrong ELF class (e.g. a 32-bit module under a 64-bit kernel), leading to
-/// an `ENOEXEC` (Invalid architecture in ELF header) failure during boot.
-fn find_module_file(name: &str) -> Option<std::path::PathBuf> {
-    let kdir = get_kernel_release();
-    if kdir.is_empty() {
-        return None;
-    }
-    let modules_dir = Path::new("/lib/modules").join(kdir);
-    let base_name = format!("{}.ko", name);
-    find_module_recursive(&modules_dir, &base_name)
-}
-
-fn decompress_module(data: &[u8], path: &Path) -> Result<Vec<u8>, std::io::Error> {
-    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-    match extension {
-        "xz" => {
-            let mut decompressed = Vec::new();
-            let mut cursor = std::io::Cursor::new(data);
-            lzma_rs::xz_decompress(&mut cursor, &mut decompressed)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-            Ok(decompressed)
-        }
-        "gz" => {
-            use std::io::Read;
-            let mut decompressed = Vec::new();
-            let mut decoder = flate2::read::GzDecoder::new(data);
-            decoder.read_to_end(&mut decompressed)?;
-            Ok(decompressed)
-        }
-        "zst" => {
-            let mut decompressed = Vec::new();
-            let mut decoder = ruzstd::decoding::FrameDecoder::new();
-            decoder
-                .decode_all_to_vec(data, &mut decompressed)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-            Ok(decompressed)
-        }
-        _ => Ok(data.to_vec()),
-    }
-}
-
-fn load_module(path: &Path) -> Result<(), std::io::Error> {
-    println!("[init] Loading kernel module: {:?}", path);
-    let raw_data = fs::read(path)?;
-    let decompressed_data = decompress_module(&raw_data, path)?;
-
-    let param = std::ffi::CString::new("").unwrap();
-    if let Err(e) = nix::kmod::init_module(&decompressed_data, &param)
-        && e != nix::errno::Errno::EEXIST
-    {
-        return Err(std::io::Error::other(e.to_string()));
-    }
-    Ok(())
-}
-
-fn load_single_module(mod_name: &str) {
-    let path = match find_module_file(mod_name) {
-        Some(p) => p,
-        None => {
-            println!(
-                "[init] Module {} not found in /lib/modules, assuming built-in or not needed.",
-                mod_name
-            );
-            return;
-        }
-    };
-
-    if let Err(e) = load_module(&path) {
-        eprintln!("[init] Failed to load module {}: {}", mod_name, e);
-    } else {
-        println!("[init] Successfully loaded module {}", mod_name);
-    }
-}
-
-pub fn load_required_modules() {
-    let modules = [
-        "virtio",
-        "virtio_ring",
-        "virtio_mmio",
-        "virtio_pci_modern_dev",
-        "virtio_pci_legacy_dev",
-        "virtio_pci",
-        "failover",
-        "net_failover",
-        "virtio_net",
-        "nfnetlink",
-        "crc32c_generic",
-        "libcrc32c",
-        "nf_defrag_ipv4",
-        "nf_defrag_ipv6",
-        "nf_tables",
-        "nf_conntrack",
-        "nf_nat",
-        "nft_ct",
-        "nft_chain_nat",
-        "nft_masq",
-    ];
-
-    for mod_name in &modules {
-        load_single_module(mod_name);
     }
 }
