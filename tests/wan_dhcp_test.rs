@@ -249,45 +249,62 @@ async fn startup_stage() -> TestEnv {
         run_mock_wan_isp(mock, verification_tx).await
     });
 
-    // D. Find kernel
-    let default_kernel = "/boot/vmlinuz-6.12.95+deb13-cloud-amd64";
-    let mut kernel = if std::path::Path::new(default_kernel).exists() {
-        default_kernel.to_string()
+    // D. Detect target architecture for simulation
+    let test_arch = std::env::var("TEST_ARCH").unwrap_or_else(|_| "x86_64".to_string());
+
+    let (qemu_bin, extra_args) = if test_arch == "arm64" {
+        ("qemu-system-aarch64", vec![
+            "-M".to_string(), "virt".to_string(),
+            "-cpu".to_string(), "cortex-a53".to_string(),
+        ])
+    } else if test_arch == "armhf" {
+        ("qemu-system-arm", vec![
+            "-M".to_string(), "virt".to_string(),
+            "-cpu".to_string(), "cortex-a7".to_string(),
+        ])
     } else {
-        "".to_string()
+        ("qemu-system-x86_64", vec![])
     };
-    if kernel.is_empty()
-        && let Ok(entries) = std::fs::read_dir("/boot")
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                let name = path.file_name().unwrap().to_string_lossy();
-                if name.starts_with("vmlinuz-")
-                    && !name.contains("rescue")
-                    && !name.contains("fallback")
-                {
-                    kernel = path.to_string_lossy().into_owned();
-                    break;
-                }
-            }
-        }
-    }
-    assert!(!kernel.is_empty(), "No Linux kernel found in /boot");
+
+    let console = if test_arch == "x86_64" { "ttyS0" } else { "ttyAMA0" };
+    let wan_if = if test_arch == "x86_64" { "eth0" } else { "eth1" };
+    let lan_if = if test_arch == "x86_64" { "eth1" } else { "eth0" };
+    let append_arg = format!(
+        "console={} quiet panic=-1 net.ifnames=0 rustyrouter.wan={} rustyrouter.lan={} rustyrouter.lan_ip=192.168.1.1/24",
+        console, wan_if, lan_if
+    );
+
+    let kernel = format!("target/{test_arch}/test_boot/vmlinuz");
+    let initrd = format!("target/{test_arch}/initramfs.cpio.gz");
+
+    let dev_arg = if test_arch == "x86_64" {
+        "virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56,romfile=".to_string()
+    } else {
+        "virtio-net-device,netdev=wan0,mac=52:54:00:12:34:56".to_string()
+    };
+    let dev_arg_lan = if test_arch == "x86_64" {
+        "virtio-net-pci,netdev=lan0,mac=52:54:00:12:34:57,romfile=".to_string()
+    } else {
+        "virtio-net-device,netdev=lan0,mac=52:54:00:12:34:57".to_string()
+    };
+
+    let mut args = extra_args;
+    args.extend([
+        "-m".to_string(), "256".to_string(),
+        "-kernel".to_string(), kernel,
+        "-initrd".to_string(), initrd,
+        "-append".to_string(), append_arg,
+        "-netdev".to_string(), "stream,id=wan0,server=off,addr.type=unix,addr.path=target/wan.sock".to_string(),
+        "-device".to_string(), dev_arg,
+        "-netdev".to_string(), "stream,id=lan0,server=on,addr.type=unix,addr.path=target/lan.sock".to_string(),
+        "-device".to_string(), dev_arg_lan,
+        "-nographic".to_string(),
+    ]);
 
     // E. Launch QEMU pointing to UNIX domain sockets
-    println!("[test-env] Launching QEMU VM...");
-    let mut qemu_child = Command::new("qemu-system-x86_64")
-        .args([
-            "-kernel", &kernel,
-            "-initrd", "target/initramfs.cpio.gz",
-            "-append", "console=ttyS0 quiet panic=-1 net.ifnames=0 rustyrouter.wan=eth0 rustyrouter.lan=eth1 rustyrouter.lan_ip=192.168.1.1/24",
-            "-netdev", "stream,id=wan0,server=off,addr.type=unix,addr.path=target/wan.sock",
-            "-device", "virtio-net-pci,netdev=wan0,mac=52:54:00:12:34:56,romfile=",
-            "-netdev", "stream,id=lan0,server=on,addr.type=unix,addr.path=target/lan.sock",
-            "-device", "virtio-net-pci,netdev=lan0,mac=52:54:00:12:34:57,romfile=",
-            "-nographic",
-        ])
+    println!("[test-env] Launching QEMU VM ({test_arch})...");
+    let mut qemu_child = Command::new(qemu_bin)
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

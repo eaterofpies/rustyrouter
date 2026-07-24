@@ -1,10 +1,7 @@
 #!/bin/bash
 # =========================================================================
-# Initramfs Builder Wrapper
-# =========================================================================
-# This script is a wrapper around the Makefile to maintain compatibility
-# with existing scripts while supporting incremental builds.
+# Initramfs Builder Wrapper (Supports ARCH parameter)
 # =========================================================================
 set -e
-
-exec make target/initramfs.cpio.gz
+ARCH=${TEST_ARCH:-x86_64}
+exec make target/${ARCH}/initramfs.cpio.gz ARCH=${ARCH}

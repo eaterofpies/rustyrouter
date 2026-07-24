@@ -269,17 +269,11 @@ fn find_module_recursive(dir: &Path, base_name: &str) -> Option<std::path::PathB
     None
 }
 
-/// Resolves the true kernel release name by reading `/proc/version`.
-/// We read from `/proc/version` because when a 32-bit binary runs on a 64-bit kernel
-/// in compatibility mode (`CONFIG_COMPAT`), the kernel intercepts the `uname` system
-/// call and spoofs the release name (returning `6.1.21-v7+` instead of `6.1.21-v8+`).
-/// Since `/proc/version` is generated directly by procfs and is not spoofed by the compat layer,
-/// parsing it gives us the un-spoofed release name (the third token).
+/// Resolves the active kernel release name.
 fn get_kernel_release() -> String {
-    if let Ok(content) = fs::read_to_string("/proc/version") {
-        let parts: Vec<&str> = content.split_whitespace().collect();
-        if parts.len() > 2 && parts[0] == "Linux" && parts[1] == "version" {
-            return parts[2].to_string();
+    if let Ok(uts) = nix::sys::utsname::uname() {
+        if let Some(release) = uts.release().to_str() {
+            return release.to_string();
         }
     }
     String::new()
@@ -364,14 +358,18 @@ fn load_single_module(mod_name: &str) {
 }
 
 pub fn load_required_modules() {
-    if !std::path::Path::new("/proc/version").exists() {
-        panic!("FATAL: /proc is not mounted. Cannot safely load kernel modules.");
-    }
     let modules = [
+        "virtio",
+        "virtio_ring",
+        "virtio_mmio",
+        "virtio_pci_modern_dev",
+        "virtio_pci_legacy_dev",
+        "virtio_pci",
         "failover",
         "net_failover",
         "virtio_net",
         "nfnetlink",
+        "crc32c_generic",
         "libcrc32c",
         "nf_defrag_ipv4",
         "nf_defrag_ipv6",

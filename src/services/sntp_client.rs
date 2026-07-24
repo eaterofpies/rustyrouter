@@ -68,12 +68,8 @@ async fn sync_time() -> Result<chrono::DateTime<chrono::Utc>, String> {
         .into_chrono_datetime()
         .map_err(|e| format!("Failed to convert NTP datetime: {}", e))?;
 
-    let unix_secs = chrono_dt.timestamp();
-    let nanosecs = chrono_dt.timestamp_subsec_nanos();
-
-    // Update system clock via nix::time
-    let timespec =
-        nix::sys::time::TimeSpec::new(unix_secs as libc::time_t, nanosecs as libc::c_long);
+    let duration = chrono_dt.signed_duration_since(chrono::DateTime::UNIX_EPOCH);
+    let timespec = nix::sys::time::TimeSpec::from(duration.to_std().unwrap());
     nix::time::clock_settime(nix::time::ClockId::CLOCK_REALTIME, timespec)
         .map_err(|e| format!("Failed to set system clock: {}", e))?;
 
